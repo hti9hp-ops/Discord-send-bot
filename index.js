@@ -1,334 +1,1525 @@
-const http = require('http');
-
-const PORT = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Bot is running');
-  })
-  .listen(PORT, '0.0.0.0', () => {
-    console.log(`HTTP server listening on port ${PORT}`);
-  });
-
 const {
   Client,
   GatewayIntentBits,
-  Events,
-  MessageFlags,
+  Partials,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  EmbedBuilder,
+  AttachmentBuilder,
+  ChannelType,
+  PermissionFlagsBits,
   REST,
   Routes,
-  SlashCommandBuilder,
-  ChannelType,
-  PermissionsBitField,
+  SlashCommandBuilder
 } = require('discord.js');
 
-const TOKEN = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
+const { Pool } = require('pg');
+const http = require('http');
+
+// ================================
+// ENVIRONMENT
+// ================================
+
+const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
 const GUILD_ID = process.env.GUILD_ID;
 const CONFIG_URL = process.env.CONFIG_URL;
+const DATABASE_URL = process.env.DATABASE_URL;
+const PORT = process.env.PORT || 8080;
 
-if (!TOKEN) {
-  console.error('TOKEN is missing in environment variables!');
-  process.exit(1);
+if (!TOKEN) throw new Error('DISCORD_TOKEN is missing');
+if (!GUILD_ID) throw new Error('GUILD_ID is missing');
+if (!CONFIG_URL) throw new Error('CONFIG_URL is missing');
+if (!DATABASE_URL) throw new Error('DATABASE_URL is missing');
+
+// ================================
+// HTTP SERVER FOR RAILWAY
+// ================================
+
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('OS Shop Bot is running');
+}).listen(PORT, '0.0.0.0', () => {
+  console.log(`HTTP server running on port ${PORT}`);
+});
+
+// ================================
+// DATABASE
+// ================================
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: process.env.PGSSLMODE === 'disable'
+    ? false
+    : { rejectUnauthorized: false }
+});
+
+async function initDatabase() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tickets (
+      id BIGSERIAL PRIMARY KEY,
+      ticket_number BIGINT UNIQUE NOT NULL,
+      guild_id TEXT NOT NULL,
+      channel_id TEXT UNIQUE NOT NULL,
+      user_id TEXT NOT NULL,
+      user_tag TEXT NOT NULL,
+      type_id TEXT,
+      type_name TEXT,
+      answers JSONB NOT NULL DEFAULT '[]'::jsonb,
+      status TEXT NOT NULL DEFAULT 'open',
+      claimed_by TEXT,
+      claimed_by_tag TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      claimed_at TIMESTAMPTZ,
+      closed_at TIMESTAMPTZ,
+      closed_by TEXT,
+      closed_by_tag TEXT,
+      close_reason TEXT,
+      archive_count INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS ticket_messages (
+      id BIGSERIAL PRIMARY KEY,
+      ticket_channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      author_id TEXT,
+      author_tag TEXT,
+      content TEXT,
+      attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
+      created_at TIMESTAMPTZ,
+      edited_at TIMESTAMPTZ,
+      deleted_at TIMESTAMPTZ,
+      is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+      UNIQUE(ticket_channel_id, message_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ticket_message_edits (
+      id BIGSERIAL PRIMARY KEY,
+      ticket_channel_id TEXT NOT NULL,
+      message_id TEXT NOT NULL,
+      editor_id TEXT,
+      old_content TEXT,
+      new_content TEXT,
+      edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS ticket_staff_actions (
+      id BIGSERIAL PRIMARY KEY,
+      ticket_channel_id TEXT NOT NULL,
+      staff_id TEXT,
+      staff_tag TEXT,
+      action TEXT NOT NULL,
+      details TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS ticket_counter (
+      id INTEGER PRIMARY KEY,
+      last_number BIGINT NOT NULL DEFAULT 0
+    );
+
+    INSERT INTO ticket_counter (id, last_number)
+    VALUES (1, 123)
+    ON CONFLICT (id) DO NOTHING;
+
+    CREATE INDEX IF NOT EXISTS idx_tickets_status
+    ON tickets(status);
+
+    CREATE INDEX IF NOT EXISTS idx_ticket_messages_channel
+    ON ticket_messages(ticket_channel_id);
+
+    CREATE INDEX IF NOT EXISTS idx_ticket_actions_channel
+    ON ticket_staff_actions(ticket_channel_id);
+
+    CREATE INDEX IF NOT EXISTS idx_ticket_edits_channel
+    ON ticket_message_edits(ticket_channel_id);
+  `);
+
+  console.log('PostgreSQL database initialized');
 }
+
+// ================================
+// DISCORD CLIENT
+// ================================
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
   ],
+  partials: [
+    Partials.Channel,
+    Partials.Message
+  ]
 });
 
 let cachedConfig = null;
-let lastFetch = 0;
+let lastPanelSignature = '';
+let lastPanelMessageId = null;
 
-async function getConfig() {
-  const now = Date.now();
-  if (cachedConfig && now - lastFetch < 30000) {
-    return cachedConfig;
-  }
-  if (!CONFIG_URL) {
-    return {};
-  }
+// channel_id -> ticket data
+const activeTickets = new Map();
+
+// ================================
+// HELPERS
+// ================================
+
+function escapeHtml(value = '') {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function formatDate(value) {
+  if (!value) return 'غير متوفر';
+
+  return new Date(value).toLocaleString('ar-IQ', {
+    dateStyle: 'medium',
+    timeStyle: 'medium'
+  });
+}
+
+function mapButtonStyle(style) {
+  const styles = {
+    Success: ButtonStyle.Success,
+    Danger: ButtonStyle.Danger,
+    Primary: ButtonStyle.Primary,
+    Secondary: ButtonStyle.Secondary
+  };
+
+  return styles[style] || ButtonStyle.Primary;
+}
+
+function formatText(text, member, guild) {
+  return String(text || '')
+    .replaceAll('{user}', `<@${member.id}>`)
+    .replaceAll('{tag}', member.user.tag)
+    .replaceAll('{server}', guild.name)
+    .replaceAll('{count}', String(guild.memberCount));
+}
+
+function getTicketType(typeId) {
+  const types = cachedConfig?.ticketTypes || [];
+  return types.find(t => t.id === typeId);
+}
+
+function isTicketChannel(channelId) {
+  return activeTickets.has(channelId);
+}
+
+async function fetchRemoteState() {
   try {
-    const res = await fetch(CONFIG_URL);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    const cfg = data && data.config ? data.config : data || {};
-    cachedConfig = cfg;
-    lastFetch = now;
-    return cachedConfig;
-  } catch (err) {
-    console.error('خطأ بجلب الإعدادات من CONFIG_URL:', err);
-    return cachedConfig || {};
+    const response = await fetch(CONFIG_URL);
+
+    if (!response.ok) {
+      throw new Error(`Config request failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+
+    if (!data.ok) {
+      throw new Error('Apps Script returned an invalid response');
+    }
+
+    cachedConfig = data.config || {};
+    return data;
+  } catch (error) {
+    console.error('Config fetch error:', error);
+    return null;
+  }
+}
+
+async function postToAppsScript(payload) {
+  try {
+    await fetch(CONFIG_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/plain;charset=utf-8'
+      },
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    console.error('Apps Script POST error:', error);
   }
 }
 
 async function syncGuildMeta(guild) {
-  if (!CONFIG_URL || !guild) return;
   try {
     await guild.channels.fetch();
     await guild.roles.fetch();
 
     const categories = guild.channels.cache
-      .filter((c) => c.type === ChannelType.GuildCategory)
-      .map((c) => ({ id: c.id, name: c.name }));
+      .filter(c => c.type === ChannelType.GuildCategory)
+      .map(c => ({
+        id: c.id,
+        name: c.name
+      }));
 
     const channels = guild.channels.cache
-      .filter((c) => c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement)
-      .map((c) => ({ id: c.id, name: c.name }));
+      .filter(c =>
+        c.type === ChannelType.GuildText ||
+        c.type === ChannelType.GuildAnnouncement
+      )
+      .map(c => ({
+        id: c.id,
+        name: `#${c.name}`
+      }));
 
     const roles = guild.roles.cache
-      .filter((r) => r.id !== guild.id && !r.managed)
-      .sort((a, b) => b.position - a.position)
-      .map((r) => ({ id: r.id, name: r.name }));
+      .filter(r => !r.managed && r.id !== guild.id)
+      .map(r => ({
+        id: r.id,
+        name: r.name
+      }));
 
-    await fetch(CONFIG_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        type: 'sync_meta',
+    await postToAppsScript({
+      type: 'sync_meta',
+      meta: {
         categories,
         channels,
-        roles,
-      }),
+        roles
+      }
     });
-    console.log('تم مزامنة الشاتات والكاتكوريات والرولات مع لوحة التحكم.');
-  } catch (err) {
-    console.error('خطأ بمزامنة بيانات السيرفر:', err);
+
+    console.log('Guild metadata synchronized');
+  } catch (error) {
+    console.error('Guild sync error:', error);
   }
 }
 
-function formatText(template, vars = {}) {
-  return String(template || '').replace(/\{(\w+)\}/g, (_, key) =>
-    vars[key] !== undefined ? String(vars[key]) : ''
-  );
+// ================================
+// DATABASE HELPERS
+// ================================
+
+async function nextTicketNumber() {
+  const result = await pool.query(`
+    UPDATE ticket_counter
+    SET last_number = last_number + 1
+    WHERE id = 1
+    RETURNING last_number
+  `);
+
+  return Number(result.rows[0].last_number);
 }
 
-const commands = [
-  new SlashCommandBuilder()
-    .setName('send')
-    .setDescription('إرسال رسالة نصية عادية إلى شات تختاره من القائمة')
-    .addChannelOption((option) =>
-      option
-        .setName('channel')
-        .setDescription('اختر الشات الذي تريد إرسال الرسالة إليه')
-        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
-        .setRequired(true)
+async function getTicket(channelId) {
+  const result = await pool.query(
+    'SELECT * FROM tickets WHERE channel_id = $1 LIMIT 1',
+    [channelId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function addStaffAction(channelId, staff, action, details = '') {
+  await pool.query(`
+    INSERT INTO ticket_staff_actions
+      (ticket_channel_id, staff_id, staff_tag, action, details)
+    VALUES ($1, $2, $3, $4, $5)
+  `, [
+    channelId,
+    staff?.id || null,
+    staff?.tag || null,
+    action,
+    details
+  ]);
+}
+
+async function saveMessage(message) {
+  if (!message.guild || !isTicketChannel(message.channelId)) return;
+
+  const attachments = [...message.attachments.values()].map(a => ({
+    name: a.name,
+    url: a.url,
+    contentType: a.contentType,
+    size: a.size
+  }));
+
+  await pool.query(`
+    INSERT INTO ticket_messages (
+      ticket_channel_id,
+      message_id,
+      author_id,
+      author_tag,
+      content,
+      attachments,
+      created_at
     )
-    .addStringOption((option) =>
-      option
-        .setName('message')
-        .setDescription('اكتب نص الرسالة العادية بدون Embed')
-        .setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName('complaint')
-    .setDescription('فتح روم شكوى خاص بك')
-    .addStringOption((option) =>
-      option
-        .setName('reason')
-        .setDescription('اكتب عنوان أو ملخص مختصر للشكوى')
-        .setRequired(false)
-    ),
-].map((command) => command.toJSON());
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+    ON CONFLICT (ticket_channel_id, message_id)
+    DO UPDATE SET
+      content = EXCLUDED.content,
+      attachments = EXCLUDED.attachments
+  `, [
+    message.channelId,
+    message.id,
+    message.author?.id || null,
+    message.author?.tag || null,
+    message.content || '',
+    JSON.stringify(attachments),
+    message.createdAt
+  ]);
+}
 
-client.once(Events.ClientReady, async (readyClient) => {
-  console.log(`البوت شغال باسم: ${readyClient.user.tag}`);
+// ================================
+// ARCHIVE GENERATOR
+// ================================
 
-  if (CLIENT_ID && GUILD_ID) {
-    const rest = new REST({ version: '10' }).setToken(TOKEN);
-    try {
-      await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
-      console.log('تم تسجيل الأوامر بنجاح!');
-    } catch (error) {
-      console.error('خطأ أثناء تسجيل الأوامر:', error);
-    }
-
-    const guild = readyClient.guilds.cache.get(GUILD_ID) || (await readyClient.guilds.fetch(GUILD_ID).catch(() => null));
-    if (guild) {
-      await syncGuildMeta(guild);
-      setInterval(() => syncGuildMeta(guild), 5 * 60 * 1000);
-    }
-  }
-});
-
-client.on(Events.GuildMemberAdd, async (member) => {
-  const cfg = await getConfig();
-  if (cfg.welcomeEnabled === false || !cfg.welcomeChannelId) return;
-
-  const channel = member.guild.channels.cache.get(cfg.welcomeChannelId);
-  if (!channel || !channel.isTextBased()) return;
-
-  const text = formatText(
-    cfg.welcomeMessage || 'أهلاً بك {user} في **{server}**! أنت العضو رقم **{count}**.',
-    {
-      user: `<@${member.id}>`,
-      server: member.guild.name,
-      count: member.guild.memberCount,
-      tag: member.user.tag,
-    }
+async function getArchiveData(channelId) {
+  const ticketResult = await pool.query(
+    'SELECT * FROM tickets WHERE channel_id = $1',
+    [channelId]
   );
 
-  try {
-    await channel.send({ content: text });
-  } catch (err) {
-    console.error('خطأ بإرسال رسالة الترحيب:', err);
+  if (!ticketResult.rows.length) return null;
+
+  const messagesResult = await pool.query(`
+    SELECT *
+    FROM ticket_messages
+    WHERE ticket_channel_id = $1
+    ORDER BY created_at ASC, id ASC
+  `, [channelId]);
+
+  const editsResult = await pool.query(`
+    SELECT *
+    FROM ticket_message_edits
+    WHERE ticket_channel_id = $1
+    ORDER BY edited_at ASC
+  `, [channelId]);
+
+  const actionsResult = await pool.query(`
+    SELECT *
+    FROM ticket_staff_actions
+    WHERE ticket_channel_id = $1
+    ORDER BY created_at ASC
+  `, [channelId]);
+
+  return {
+    ticket: ticketResult.rows[0],
+    messages: messagesResult.rows,
+    edits: editsResult.rows,
+    actions: actionsResult.rows
+  };
+}
+
+function generateArchiveHtml(data) {
+  const t = data.ticket;
+
+  const answers = Array.isArray(t.answers) ? t.answers : [];
+
+  const answerHtml = answers.map(a => `
+    <div class="item">
+      <strong>${escapeHtml(a.label)}</strong>
+      <p>${escapeHtml(a.value)}</p>
+    </div>
+  `).join('');
+
+  const messagesHtml = data.messages.map(m => {
+    const attachments = Array.isArray(m.attachments)
+      ? m.attachments
+      : [];
+
+    const attachmentHtml = attachments.map(a => `
+      <div class="attachment">
+        📎 <a href="${escapeHtml(a.url)}">${escapeHtml(a.name || 'مرفق')}</a>
+      </div>
+    `).join('');
+
+    return `
+      <div class="message ${m.is_deleted ? 'deleted' : ''}">
+        <div class="message-head">
+          <strong>${escapeHtml(m.author_tag || 'مستخدم غير معروف')}</strong>
+          <small>${escapeHtml(formatDate(m.created_at))}</small>
+        </div>
+        <p>${escapeHtml(m.content || '')}</p>
+        ${m.is_deleted ? '<b>تم حذف هذه الرسالة</b>' : ''}
+        ${attachmentHtml}
+      </div>
+    `;
+  }).join('');
+
+  const editsHtml = data.edits.map(e => `
+    <div class="item">
+      <strong>تعديل رسالة: ${escapeHtml(e.message_id)}</strong>
+      <p>قبل التعديل: ${escapeHtml(e.old_content || '')}</p>
+      <p>بعد التعديل: ${escapeHtml(e.new_content || '')}</p>
+      <small>${escapeHtml(formatDate(e.edited_at))}</small>
+    </div>
+  `).join('');
+
+  const actionsHtml = data.actions.map(a => `
+    <div class="item">
+      <strong>${escapeHtml(a.action)}</strong>
+      <p>${escapeHtml(a.staff_tag || a.staff_id || 'غير معروف')}</p>
+      <p>${escapeHtml(a.details || '')}</p>
+      <small>${escapeHtml(formatDate(a.created_at))}</small>
+    </div>
+  `).join('');
+
+  return `<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<title>أرشيف الشكوى #${t.ticket_number}</title>
+<style>
+body {
+  font-family: Arial, Tahoma, sans-serif;
+  background: #f3f4f6;
+  color: #222;
+  padding: 25px;
+  line-height: 1.8;
+}
+.container {
+  max-width: 950px;
+  margin: auto;
+  background: white;
+  padding: 25px;
+  border-radius: 12px;
+}
+h1, h2 {
+  border-bottom: 2px solid #5865f2;
+  padding-bottom: 8px;
+}
+.item, .message {
+  background: #f7f7f9;
+  border: 1px solid #ddd;
+  padding: 12px;
+  border-radius: 8px;
+  margin: 10px 0;
+  overflow-wrap: anywhere;
+}
+.message-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.message p {
+  white-space: pre-wrap;
+}
+.deleted {
+  border-color: #da373c;
+}
+.attachment {
+  margin-top: 8px;
+}
+small {
+  color: #666;
+}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>أرشيف الشكوى رقم ${t.ticket_number}</h1>
+
+<h2>معلومات الشكوى</h2>
+<div class="item">
+<p>صاحب الشكوى: ${escapeHtml(t.user_tag)}</p>
+<p>رقم المستخدم: ${escapeHtml(t.user_id)}</p>
+<p>نوع الشكوى: ${escapeHtml(t.type_name || '')}</p>
+<p>الحالة: ${escapeHtml(t.status)}</p>
+<p>تاريخ الفتح: ${escapeHtml(formatDate(t.created_at))}</p>
+<p>تاريخ الإغلاق: ${escapeHtml(formatDate(t.closed_at))}</p>
+<p>المستلم: ${escapeHtml(t.claimed_by_tag || 'لم يتم الاستلام')}</p>
+<p>المغلق بواسطة: ${escapeHtml(t.closed_by_tag || 'لم تغلق')}</p>
+<p>سبب الإغلاق: ${escapeHtml(t.close_reason || 'غير محدد')}</p>
+</div>
+
+<h2>إجابات صاحب الشكوى</h2>
+${answerHtml || '<p>لا توجد إجابات</p>'}
+
+<h2>سجل المحادثة</h2>
+${messagesHtml || '<p>لا توجد رسائل مسجلة</p>'}
+
+<h2>تعديلات الرسائل</h2>
+${editsHtml || '<p>لا توجد تعديلات مسجلة</p>'}
+
+<h2>الإجراءات الإدارية</h2>
+${actionsHtml || '<p>لا توجد إجراءات مسجلة</p>'}
+
+</div>
+</body>
+</html>`;
+}
+
+function generateArchiveTxt(data) {
+  const t = data.ticket;
+  const lines = [];
+
+  lines.push(`أرشيف الشكوى رقم ${t.ticket_number}`);
+  lines.push('================================');
+  lines.push(`صاحب الشكوى: ${t.user_tag}`);
+  lines.push(`رقم المستخدم: ${t.user_id}`);
+  lines.push(`نوع الشكوى: ${t.type_name || ''}`);
+  lines.push(`الحالة: ${t.status}`);
+  lines.push(`تاريخ الفتح: ${formatDate(t.created_at)}`);
+  lines.push(`تاريخ الإغلاق: ${formatDate(t.closed_at)}`);
+  lines.push(`المستلم: ${t.claimed_by_tag || 'لم يتم الاستلام'}`);
+  lines.push(`المغلق بواسطة: ${t.closed_by_tag || 'لم تغلق'}`);
+  lines.push(`سبب الإغلاق: ${t.close_reason || 'غير محدد'}`);
+
+  lines.push('\nالإجابات');
+  lines.push('================================');
+
+  for (const a of (Array.isArray(t.answers) ? t.answers : [])) {
+    lines.push(`${a.label}: ${a.value}`);
   }
-});
 
-client.on(Events.GuildMemberRemove, async (member) => {
-  const cfg = await getConfig();
-  if (cfg.goodbyeEnabled === false || !cfg.goodbyeChannelId) return;
+  lines.push('\nالمحادثة');
+  lines.push('================================');
 
-  const channel = member.guild.channels.cache.get(cfg.goodbyeChannelId);
+  for (const m of data.messages) {
+    lines.push('');
+    lines.push(`[${formatDate(m.created_at)}] ${m.author_tag || 'غير معروف'}`);
+    lines.push(m.content || '');
+
+    if (m.is_deleted) {
+      lines.push('[تم حذف الرسالة]');
+    }
+
+    const attachments = Array.isArray(m.attachments)
+      ? m.attachments
+      : [];
+
+    for (const a of attachments) {
+      lines.push(`مرفق: ${a.name || 'ملف'} - ${a.url}`);
+    }
+  }
+
+  lines.push('\nتعديلات الرسائل');
+  lines.push('================================');
+
+  for (const e of data.edits) {
+    lines.push(`الرسالة: ${e.message_id}`);
+    lines.push(`قبل: ${e.old_content || ''}`);
+    lines.push(`بعد: ${e.new_content || ''}`);
+    lines.push(`التاريخ: ${formatDate(e.edited_at)}`);
+  }
+
+  lines.push('\nالإجراءات الإدارية');
+  lines.push('================================');
+
+  for (const a of data.actions) {
+    lines.push(`${a.action} - ${a.staff_tag || a.staff_id || ''}`);
+    lines.push(a.details || '');
+    lines.push(formatDate(a.created_at));
+  }
+
+  return lines.join('\n');
+}
+
+async function sendArchiveToLogChannel(guild, channelId, label) {
+  const data = await getArchiveData(channelId);
+
+  if (!data) {
+    console.error('Ticket archive data not found:', channelId);
+    return false;
+  }
+
+  const logChannelId = cachedConfig?.logChannelId;
+
+  if (!logChannelId) {
+    console.error('No log channel selected in dashboard');
+    return false;
+  }
+
+  const logChannel = await guild.channels.fetch(logChannelId).catch(() => null);
+
+  if (!logChannel || !logChannel.isTextBased()) {
+    console.error('Log channel not found or not text-based');
+    return false;
+  }
+
+  const html = generateArchiveHtml(data);
+  const txt = generateArchiveTxt(data);
+
+  const number = data.ticket.ticket_number;
+
+  const files = [
+    new AttachmentBuilder(
+      Buffer.from(html, 'utf8'),
+      { name: `ticket-${number}.html` }
+    ),
+    new AttachmentBuilder(
+      Buffer.from(txt, 'utf8'),
+      { name: `ticket-${number}.txt` }
+    )
+  ];
+
+  const embed = new EmbedBuilder()
+    .setColor(data.ticket.status === 'closed' ? 0xDA373C : 0x5865F2)
+    .setTitle(`أرشيف الشكوى #${number}`)
+    .setDescription(
+      `**صاحب الشكوى:** <@${data.ticket.user_id}>\n` +
+      `**النوع:** ${data.ticket.type_name || 'غير محدد'}\n` +
+      `**الحالة:** ${data.ticket.status}\n` +
+      `**نوع الأرشيف:** ${label}`
+    )
+    .setTimestamp();
+
+  try {
+    await logChannel.send({
+      embeds: [embed],
+      files,
+      allowedMentions: { parse: [] }
+    });
+
+    await pool.query(
+      'UPDATE tickets SET archive_count = archive_count + 1 WHERE channel_id = $1',
+      [channelId]
+    );
+
+    return true;
+  } catch (error) {
+    console.error('Archive send error:', error);
+    return false;
+  }
+}
+
+// ================================
+// PANEL
+// ================================
+
+function buildPanelPayload() {
+  const cfg = cachedConfig || {};
+  const embed = new EmbedBuilder()
+    .setColor(0x5865F2)
+    .setTitle(cfg.panelTitle || 'نظام الشكاوى')
+    .setDescription(cfg.panelDescription || 'اختر نوع الشكوى من الأزرار أدناه.');
+
+  if (cfg.panelImageUrl && /^https?:\/\//i.test(cfg.panelImageUrl)) {
+    embed.setImage(cfg.panelImageUrl);
+  }
+
+  const rows = [];
+  let currentRow = new ActionRowBuilder();
+
+  for (const type of (cfg.ticketTypes || [])) {
+    const button = new ButtonBuilder()
+      .setCustomId(`open_ticket_type:${type.id}`)
+      .setLabel(type.buttonLabel || type.sectionTitle || 'فتح شكوى')
+      .setStyle(mapButtonStyle(type.buttonStyle));
+
+    if (currentRow.components.length >= 5) {
+      rows.push(currentRow);
+      currentRow = new ActionRowBuilder();
+    }
+
+    currentRow.addComponents(button);
+  }
+
+  if (currentRow.components.length) {
+    rows.push(currentRow);
+  }
+
+  return {
+    embeds: [embed],
+    components: rows
+  };
+}
+
+async function ensurePanelChannel(guild) {
+  const channelId = cachedConfig?.panelChannelId;
+  if (!channelId) return;
+
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
 
-  const text = formatText(
-    cfg.goodbyeMessage || 'غادر السيرفر **{tag}**، العدد الحالي: **{count}**.',
-    {
-      user: `<@${member.id}>`,
-      server: member.guild.name,
-      count: member.guild.memberCount,
-      tag: member.user.tag || member.user.username,
-    }
-  );
+  const payload = buildPanelPayload();
+  const signature = JSON.stringify(payload);
 
-  try {
-    await channel.send({ content: text });
-  } catch (err) {
-    console.error('خطأ بإرسال رسالة التوديع:', err);
-  }
-});
-
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
-
-  if (interaction.commandName === 'send') {
-    const targetChannel = interaction.options.getChannel('channel');
-    const messageText = interaction.options.getString('message');
-
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-    try {
-      await targetChannel.send({ content: messageText });
-      await interaction.editReply({
-        content: `تم إرسال رسالتك إلى <#${targetChannel.id}>`,
-      });
-    } catch (err) {
-      console.error(err);
-      await interaction.editReply({
-        content: 'تعذر الإرسال، تأكد من صلاحيات البوت في هذا الشات.',
-      });
-    }
+  if (signature === lastPanelSignature && lastPanelMessageId) {
     return;
   }
 
-  if (interaction.commandName === 'complaint') {
-    if (!interaction.guild) {
-      await interaction.reply({
-        content: 'هذا الأمر يعمل داخل السيرفر فقط.',
-        flags: MessageFlags.Ephemeral,
-      });
+  if (lastPanelMessageId) {
+    const oldMessage = await channel.messages
+      .fetch(lastPanelMessageId)
+      .catch(() => null);
+
+    if (oldMessage) {
+      await oldMessage.edit(payload).catch(() => null);
+      lastPanelSignature = signature;
       return;
     }
+  }
 
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const recent = await channel.messages.fetch({ limit: 30 }).catch(() => null);
 
-    try {
-      const cfg = await getConfig();
-      const roleIds = String(cfg.mentionRoleIds || '')
-        .split(',')
-        .map((id) => id.trim())
-        .filter((id) => /^\d{17,20}$/.test(id));
+  const existing = recent?.find(m =>
+    m.author.id === client.user.id &&
+    m.embeds[0]?.title === (cachedConfig.panelTitle || 'نظام الشكاوى')
+  );
 
-      const permissionOverwrites = [
-        {
-          id: interaction.guild.roles.everyone.id,
-          deny: [PermissionsBitField.Flags.ViewChannel],
-        },
-        {
-          id: interaction.user.id,
-          allow: [
-            PermissionsBitField.Flags.ViewChannel,
-            PermissionsBitField.Flags.SendMessages,
-            PermissionsBitField.Flags.ReadMessageHistory,
-          ],
-        },
-        {
-          id: client.user.id,
-          allow: [
-            PermissionsBitField.Flags.ViewChannel,
-            PermissionsBitField.Flags.SendMessages,
-            PermissionsBitField.Flags.ManageChannels,
-            PermissionsBitField.Flags.ReadMessageHistory,
-          ],
-        },
-      ];
+  if (existing) {
+    await existing.edit(payload).catch(() => null);
+    lastPanelMessageId = existing.id;
+  } else {
+    const sent = await channel.send(payload);
+    lastPanelMessageId = sent.id;
+  }
 
-      for (const roleId of roleIds) {
-        if (interaction.guild.roles.cache.has(roleId)) {
-          permissionOverwrites.push({
-            id: roleId,
-            allow: [
-              PermissionsBitField.Flags.ViewChannel,
-              PermissionsBitField.Flags.SendMessages,
-              PermissionsBitField.Flags.ReadMessageHistory,
-            ],
+  lastPanelSignature = signature;
+}
+
+// ================================
+// STAFF PERMISSIONS
+// ================================
+
+function isStaffMember(member, ticketType) {
+  if (!member || !ticketType) return false;
+
+  const staffRoles = ticketType.staffRoleIds || [];
+
+  if (!staffRoles.length) {
+    return member.permissions.has(PermissionFlagsBits.Administrator);
+  }
+
+  return staffRoles.some(roleId => member.roles.cache.has(roleId)) ||
+    member.permissions.has(PermissionFlagsBits.Administrator);
+}
+
+// ================================
+// SLASH COMMAND
+// ================================
+
+async function registerCommands() {
+  const commands = [
+    new SlashCommandBuilder()
+      .setName('send-panel')
+      .setDescription('إرسال لوحة الشكاوى')
+  ].map(c => c.toJSON());
+
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+
+  await rest.put(
+    Routes.applicationGuildCommands(client.user.id, GUILD_ID),
+    { body: commands }
+  );
+
+  console.log('Slash commands registered');
+}
+
+// ================================
+// STARTUP
+// ================================
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+
+  try {
+    await initDatabase();
+
+    const guild = await client.guilds.fetch(GUILD_ID);
+
+    await registerCommands();
+    await syncGuildMeta(guild);
+    await fetchRemoteState();
+    await ensurePanelChannel(guild);
+
+    const result = await pool.query(`
+      SELECT *
+      FROM tickets
+      WHERE status = 'open'
+    `);
+
+    for (const ticket of result.rows) {
+      activeTickets.set(ticket.channel_id, ticket);
+    }
+
+    console.log(`Restored ${result.rows.length} open tickets`);
+
+    setInterval(async () => {
+      await fetchRemoteState();
+      await ensurePanelChannel(guild);
+      await syncGuildMeta(guild);
+    }, 60000);
+
+  } catch (error) {
+    console.error('Startup error:', error);
+  }
+});
+
+// ================================
+// WELCOME / GOODBYE
+// ================================
+
+client.on('guildMemberAdd', async member => {
+  try {
+    if (!cachedConfig) await fetchRemoteState();
+
+    const cfg = cachedConfig;
+    if (!cfg?.welcomeEnabled || !cfg.welcomeChannelId) return;
+
+    const channel = await member.guild.channels
+      .fetch(cfg.welcomeChannelId)
+      .catch(() => null);
+
+    if (!channel) return;
+
+    await channel.send({
+      content: formatText(
+        cfg.welcomeMessage,
+        member,
+        member.guild
+      ),
+      allowedMentions: {
+        users: [member.id]
+      }
+    });
+  } catch (error) {
+    console.error('Welcome error:', error);
+  }
+});
+
+client.on('guildMemberRemove', async member => {
+  try {
+    if (!cachedConfig) await fetchRemoteState();
+
+    const cfg = cachedConfig;
+    if (!cfg?.goodbyeEnabled || !cfg.goodbyeChannelId) return;
+
+    const channel = await member.guild.channels
+      .fetch(cfg.goodbyeChannelId)
+      .catch(() => null);
+
+    if (!channel) return;
+
+    await channel.send({
+      content: String(cfg.goodbyeMessage || '')
+        .replaceAll('{tag}', member.user.tag)
+        .replaceAll('{server}', member.guild.name)
+        .replaceAll('{count}', String(member.guild.memberCount)),
+      allowedMentions: { parse: [] }
+    });
+  } catch (error) {
+    console.error('Goodbye error:', error);
+  }
+});
+
+// ================================
+// MESSAGE LOGGING
+// ================================
+
+client.on('messageCreate', async message => {
+  try {
+    if (message.author.bot) return;
+    await saveMessage(message);
+  } catch (error) {
+    console.error('Message save error:', error);
+  }
+});
+
+client.on('messageUpdate', async (oldMessage, newMessage) => {
+  try {
+    if (newMessage.partial) {
+      newMessage = await newMessage.fetch().catch(() => null);
+    }
+
+    if (!newMessage || !isTicketChannel(newMessage.channelId)) return;
+
+    const oldContent = oldMessage.content || '';
+    const newContent = newMessage.content || '';
+
+    await pool.query(`
+      INSERT INTO ticket_message_edits (
+        ticket_channel_id,
+        message_id,
+        editor_id,
+        old_content,
+        new_content
+      )
+      VALUES ($1, $2, $3, $4, $5)
+    `, [
+      newMessage.channelId,
+      newMessage.id,
+      newMessage.author?.id || null,
+      oldContent,
+      newContent
+    ]);
+
+    await saveMessage(newMessage);
+
+  } catch (error) {
+    console.error('Message update error:', error);
+  }
+});
+
+client.on('messageDelete', async message => {
+  try {
+    if (!isTicketChannel(message.channelId)) return;
+
+    await pool.query(`
+      UPDATE ticket_messages
+      SET is_deleted = TRUE,
+          deleted_at = NOW()
+      WHERE ticket_channel_id = $1
+        AND message_id = $2
+    `, [
+      message.channelId,
+      message.id
+    ]);
+
+  } catch (error) {
+    console.error('Message delete error:', error);
+  }
+});
+
+client.on('messageDeleteBulk', async messages => {
+  try {
+    for (const message of messages.values()) {
+      if (!isTicketChannel(message.channelId)) continue;
+
+      await pool.query(`
+        UPDATE ticket_messages
+        SET is_deleted = TRUE,
+            deleted_at = NOW()
+        WHERE ticket_channel_id = $1
+          AND message_id = $2
+      `, [
+        message.channelId,
+        message.id
+      ]);
+    }
+  } catch (error) {
+    console.error('Bulk delete error:', error);
+  }
+});
+
+// ================================
+// INTERACTIONS
+// ================================
+
+client.on('interactionCreate', async interaction => {
+  try {
+
+    // ----------------------------
+    // SLASH COMMAND
+    // ----------------------------
+
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === 'send-panel') {
+        await fetchRemoteState();
+
+        const guild = interaction.guild;
+        const channelId = cachedConfig?.panelChannelId;
+
+        if (!channelId) {
+          return interaction.reply({
+            content: 'حدد روم لوحة الشكاوى من لوحة التحكم أولاً.',
+            ephemeral: true
           });
         }
-      }
 
-      const cleanName = interaction.user.username
-        .toLowerCase()
-        .replace(/[^a-z0-9-_]/g, '')
-        .slice(0, 15) || 'user';
+        const channel = await guild.channels.fetch(channelId).catch(() => null);
 
-      const channelOptions = {
-        name: `شكوى-${cleanName}`,
-        type: ChannelType.GuildText,
-        permissionOverwrites,
-      };
-
-      if (cfg.ticketCategoryId && /^\d{17,20}$/.test(String(cfg.ticketCategoryId).trim())) {
-        channelOptions.parent = String(cfg.ticketCategoryId).trim();
-      }
-
-      const ticketChannel = await interaction.guild.channels.create(channelOptions);
-
-      const mentions = roleIds.map((id) => `<@&${id}>`).join(' ');
-      const bodyText = formatText(
-        cfg.ticketMessage || 'أهلاً {user}، اكتب تفاصيل شكواك هنا وسيتم الرد عليك قريباً.',
-        {
-          user: `<@${interaction.user.id}>`,
-          server: interaction.guild.name,
+        if (!channel || !channel.isTextBased()) {
+          return interaction.reply({
+            content: 'روم اللوحة غير موجود أو غير صالح.',
+            ephemeral: true
+          });
         }
-      );
 
-      const reason = interaction.options.getString('reason');
-      const reasonLine = reason ? `\n**الموضوع:** ${reason}` : '';
-      const finalMessage = `${mentions ? `${mentions}\n` : ''}${bodyText}${reasonLine}`;
+        const sent = await channel.send(buildPanelPayload());
+        lastPanelMessageId = sent.id;
+        lastPanelSignature = JSON.stringify(buildPanelPayload());
 
-      await ticketChannel.send({ content: finalMessage });
+        return interaction.reply({
+          content: 'تم إرسال لوحة الشكاوى.',
+          ephemeral: true
+        });
+      }
+    }
 
-      await interaction.editReply({
-        content: `تم فتح شكواك في <#${ticketChannel.id}>`,
-      });
-    } catch (err) {
-      console.error('خطأ بفتح التكت:', err);
-      await interaction.editReply({
-        content: 'تعذر فتح الشكوى، تأكد من صلاحية Manage Channels للبوت ومن صحة ID الكاتكوري والرولات.',
-      });
+    // ----------------------------
+    // BUTTONS
+    // ----------------------------
+
+    if (interaction.isButton()) {
+
+      // Open ticket form
+      if (interaction.customId.startsWith('open_ticket_type:')) {
+        const typeId = interaction.customId.split(':')[1];
+        const type = getTicketType(typeId);
+
+        if (!type) {
+          return interaction.reply({
+            content: 'نوع الشكوى غير موجود. حدّث لوحة الشكاوى.',
+            ephemeral: true
+          });
+        }
+
+        const member = interaction.member;
+        const allowedRoles = type.allowedRoleIds || [];
+
+        if (
+          allowedRoles.length &&
+          !allowedRoles.some(id => member.roles.cache.has(id))
+        ) {
+          return interaction.reply({
+            content: 'لا تملك صلاحية فتح هذا النوع من الشكاوى.',
+            ephemeral: true
+          });
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId(`submit_ticket:${type.id}`)
+          .setTitle((type.sectionTitle || 'فتح شكوى').slice(0, 45));
+
+        const fields = (type.fields || []).slice(0, 5);
+
+        if (!fields.length) {
+          fields.push({
+            label: 'اكتب تفاصيل الشكوى',
+            placeholder: 'اكتب التفاصيل هنا',
+            style: 'Paragraph',
+            required: true
+          });
+        }
+
+        for (let i = 0; i < fields.length; i++) {
+          const field = fields[i];
+
+          const input = new TextInputBuilder()
+            .setCustomId(`answer_${i}`)
+            .setLabel((field.label || `السؤال ${i + 1}`).slice(0, 45))
+            .setPlaceholder((field.placeholder || 'اكتب إجابتك').slice(0, 100))
+            .setStyle(
+              field.style === 'Paragraph'
+                ? TextInputStyle.Paragraph
+                : TextInputStyle.Short
+            )
+            .setRequired(field.required !== false);
+
+          modal.addComponents(
+            new ActionRowBuilder().addComponents(input)
+          );
+        }
+
+        return interaction.showModal(modal);
+      }
+
+      // Claim ticket
+      if (interaction.customId === 'claim_ticket') {
+        const ticket = await getTicket(interaction.channelId);
+
+        if (!ticket || ticket.status !== 'open') {
+          return interaction.reply({
+            content: 'هذه الشكوى غير متاحة للاستلام.',
+            ephemeral: true
+          });
+        }
+
+        const type = getTicketType(ticket.type_id);
+
+        if (!isStaffMember(interaction.member, type)) {
+          return interaction.reply({
+            content: 'ليس لديك صلاحية استلام هذه الشكوى.',
+            ephemeral: true
+          });
+        }
+
+        if (ticket.claimed_by) {
+          return interaction.reply({
+            content: `تم استلام الشكوى مسبقاً بواسطة <@${ticket.claimed_by}>.`,
+            ephemeral: true
+          });
+        }
+
+        await pool.query(`
+          UPDATE tickets
+          SET claimed_by = $1,
+              claimed_by_tag = $2,
+              claimed_at = NOW()
+          WHERE channel_id = $3
+        `, [
+          interaction.user.id,
+          interaction.user.tag,
+          interaction.channelId
+        ]);
+
+        await addStaffAction(
+          interaction.channelId,
+          interaction.user,
+          'استلام الشكوى',
+          'تم استلام الشكوى من قبل الإدارة'
+        );
+
+        activeTickets.set(interaction.channelId, {
+          ...ticket,
+          claimed_by: interaction.user.id,
+          claimed_by_tag: interaction.user.tag
+        });
+
+        return interaction.reply({
+          content: `تم استلام الشكوى بواسطة <@${interaction.user.id}>.`,
+          allowedMentions: { users: [interaction.user.id] }
+        });
+      }
+
+      // Save archive snapshot
+      if (interaction.customId === 'record_ticket') {
+        const ticket = await getTicket(interaction.channelId);
+
+        if (!ticket) {
+          return interaction.reply({
+            content: 'لم أجد بيانات هذه الشكوى.',
+            ephemeral: true
+          });
+        }
+
+        const type = getTicketType(ticket.type_id);
+
+        if (!isStaffMember(interaction.member, type)) {
+          return interaction.reply({
+            content: 'ليس لديك صلاحية تسجيل الشكوى.',
+            ephemeral: true
+          });
+        }
+
+        await interaction.deferReply({ ephemeral: true });
+
+        const sent = await sendArchiveToLogChannel(
+          interaction.guild,
+          interaction.channelId,
+          'نسخة أرشيف'
+        );
+
+        return interaction.editReply(
+          sent
+            ? 'تم إرسال نسخة الأرشيف إلى روم السجل.'
+            : 'تعذر إرسال الأرشيف. تحقق من روم السجل وصلاحيات البوت.'
+        );
+      }
+
+      // Close ticket
+      if (interaction.customId === 'close_ticket') {
+        const ticket = await getTicket(interaction.channelId);
+
+        if (!ticket || ticket.status !== 'open') {
+          return interaction.reply({
+            content: 'هذه الشكوى مغلقة أو غير موجودة.',
+            ephemeral: true
+          });
+        }
+
+        const type = getTicketType(ticket.type_id);
+
+        if (!isStaffMember(interaction.member, type)) {
+          return interaction.reply({
+            content: 'ليس لديك صلاحية إغلاق هذه الشكوى.',
+            ephemeral: true
+          });
+        }
+
+        const modal = new ModalBuilder()
+          .setCustomId('close_ticket_reason')
+          .setTitle('إغلاق الشكوى');
+
+        const reason = new TextInputBuilder()
+          .setCustomId('close_reason')
+          .setLabel('سبب إغلاق الشكوى')
+          .setPlaceholder('اكتب سبب الإغلاق')
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(1000);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(reason)
+        );
+
+        return interaction.showModal(modal);
+      }
+    }
+
+    // ----------------------------
+    // MODALS
+    // ----------------------------
+
+    if (interaction.isModalSubmit()) {
+
+      // Submit new ticket
+      if (interaction.customId.startsWith('submit_ticket:')) {
+        await interaction.deferReply({ ephemeral: true });
+
+        const typeId = interaction.customId.split(':')[1];
+        const type = getTicketType(typeId);
+
+        if (!type) {
+          return interaction.editReply('نوع الشكوى غير موجود.');
+        }
+
+        const answers = [];
+        const fields = (type.fields || []).slice(0, 5);
+
+        if (!fields.length) {
+          answers.push({
+            label: 'تفاصيل الشكوى',
+            value: interaction.fields.getTextInputValue('answer_0')
+          });
+        } else {
+          for (let i = 0; i < fields.length; i++) {
+            answers.push({
+              label: fields[i].label || `السؤال ${i + 1}`,
+              value: interaction.fields.getTextInputValue(`answer_${i}`)
+            });
+          }
+        }
+
+        const category = type.categoryId
+          ? await interaction.guild.channels.fetch(type.categoryId).catch(() => null)
+          : null;
+
+        const ticketNumber = await nextTicketNumber();
+
+        const safeName = interaction.user.username
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, '')
+          .slice(0, 12) || 'user';
+
+        const channel = await interaction.guild.channels.create({
+          name: `شكوى-${ticketNumber}-${safeName}`.slice(0, 95),
+          type: ChannelType.GuildText,
+          parent: category?.type === ChannelType.GuildCategory
+            ? category.id
+            : undefined,
+          permissionOverwrites: [
+            {
+              id: interaction.guild.id,
+              deny: [PermissionFlagsBits.ViewChannel]
+            },
+            {
+              id: interaction.user.id,
+              allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.SendMessages,
+                PermissionFlagsBits.ReadMessageHistory,
+                PermissionFlagsBits.AttachFiles,
+                PermissionFlagsBits.EmbedLinks
+              ]
+            },
+            {
+              id: client.user.id,
+              allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.SendMessages,
+                PermissionFlagsBits.ReadMessageHistory,
+                PermissionFlagsBits.ManageChannels,
+                PermissionFlagsBits.AttachFiles,
+                PermissionFlagsBits.EmbedLinks
+              ]
+            }
+          ]
+        });
+
+        for (const roleId of (type.staffRoleIds || [])) {
+          await channel.permissionOverwrites.edit(roleId, {
+            ViewChannel: true,
+            SendMessages: true,
+            ReadMessageHistory: true,
+            AttachFiles: true,
+            EmbedLinks: true
+          }).catch(error => {
+            console.error('Could not add staff role permission:', error);
+          });
+        }
+
+        await pool.query(`
+          INSERT INTO tickets (
+            ticket_number,
+            guild_id,
+            channel_id,
+            user_id,
+            user_tag,
+            type_id,
+            type_name,
+            answers
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+        `, [
+          ticketNumber,
+          interaction.guildId,
+          channel.id,
+          interaction.user.id,
+          interaction.user.tag,
+          type.id,
+          type.sectionTitle || 'شكوى',
+          JSON.stringify(answers)
+        ]);
+
+        const ticketData = {
+          channel_id: channel.id,
+          ticket_number: ticketNumber,
+          user_id: interaction.user.id,
+          user_tag: interaction.user.tag,
+          type_id: type.id,
+          type_name: type.sectionTitle || 'شكوى',
+          answers,
+          status: 'open'
+        };
+
+        activeTickets.set(channel.id, ticketData);
+
+        const answerText = answers.map(a =>
+          `**${a.label}:**\n${a.value}`
+        ).join('\n\n');
+
+        const embed = new EmbedBuilder()
+          .setColor(0x5865F2)
+          .setTitle(`شكوى جديدة #${ticketNumber}`)
+          .setDescription(
+            `**صاحب الشكوى:** <@${interaction.user.id}>\n` +
+            `**نوع الشكوى:** ${type.sectionTitle || 'شكوى'}\n\n` +
+            `${answerText}\n\n` +
+            `${type.evidenceNote || ''}`
+          )
+          .setFooter({ text: 'نظام الشكاوى - OS Shop' })
+          .setTimestamp();
+
+        const buttons = new ActionRowBuilder().addComponents(
+          new ButtonBuilder()
+            .setCustomId('claim_ticket')
+            .setLabel('استلام الشكوى')
+            .setStyle(ButtonStyle.Success),
+
+          new ButtonBuilder()
+            .setCustomId('record_ticket')
+            .setLabel('تسجيل الأرشيف')
+            .setStyle(ButtonStyle.Secondary),
+
+          new ButtonBuilder()
+            .setCustomId('close_ticket')
+            .setLabel('إغلاق الشكوى')
+            .setStyle(ButtonStyle.Danger)
+        );
+
+        const mentionRoles = (type.staffRoleIds || [])
+          .map(id => `<@&${id}>`)
+          .join(' ');
+
+        const openingMessage = await channel.send({
+          content: mentionRoles || `<@${interaction.user.id}>`,
+          embeds: [embed],
+          components: [buttons],
+          allowedMentions: {
+            users: [interaction.user.id],
+            roles: type.staffRoleIds || []
+          }
+        });
+
+        await saveMessage(openingMessage);
+
+        await addStaffAction(
+          channel.id,
+          interaction.user,
+          'فتح الشكوى',
+          `تم فتح الشكوى رقم ${ticketNumber}`
+        );
+
+        return interaction.editReply({
+          content: `تم فتح شكواك بنجاح: <#${channel.id}>`
+        });
+      }
+
+      // Close reason modal
+      if (interaction.customId === 'close_ticket_reason') {
+        await interaction.deferReply({ ephemeral: true });
+
+        const ticket = await getTicket(interaction.channelId);
+
+        if (!ticket || ticket.status !== 'open') {
+          return interaction.editReply('هذه الشكوى مغلقة مسبقاً أو غير موجودة.');
+        }
+
+        const reason = interaction.fields.getTextInputValue('close_reason');
+
+        await pool.query(`
+          UPDATE tickets
+          SET status = 'closed',
+              closed_at = NOW(),
+              closed_by = $1,
+              closed_by_tag = $2,
+              close_reason = $3
+          WHERE channel_id = $4
+        `, [
+          interaction.user.id,
+          interaction.user.tag,
+          reason,
+          interaction.channelId
+        ]);
+
+        await addStaffAction(
+          interaction.channelId,
+          interaction.user,
+          'إغلاق الشكوى',
+          reason
+        );
+
+        const updatedTicket = await getTicket(interaction.channelId);
+
+        activeTickets.set(interaction.channelId, updatedTicket);
+
+        const archiveSent = await sendArchiveToLogChannel(
+          interaction.guild,
+          interaction.channelId,
+          'الأرشيف النهائي بعد الإغلاق'
+        );
+
+        await interaction.editReply(
+          archiveSent
+            ? 'تم إغلاق الشكوى وإرسال الأرشيف النهائي.'
+            : 'تم إغلاق الشكوى، لكن تعذر إرسال الأرشيف. راجع إعدادات روم السجل.'
+        );
+
+        await interaction.channel.send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0xDA373C)
+              .setTitle('تم إغلاق الشكوى')
+              .setDescription(
+                `**بواسطة:** <@${interaction.user.id}>\n` +
+                `**السبب:** ${reason}`
+              )
+              .setTimestamp()
+          ]
+        });
+
+        activeTickets.delete(interaction.channelId);
+
+        return;
+      }
+    }
+
+  } catch (error) {
+    console.error('Interaction error:', error);
+
+    const message = 'حدث خطأ أثناء تنفيذ العملية. راجع سجلات البوت.';
+
+    if (interaction.deferred || interaction.replied) {
+      await interaction.followUp({
+        content: message,
+        ephemeral: true
+      }).catch(() => {});
+    } else {
+      await interaction.reply({
+        content: message,
+        ephemeral: true
+      }).catch(() => {});
     }
   }
 });
 
-client.on('error', (err) => {
-  console.error('Discord client error:', err);
-});
+// ================================
+// LOGIN
+// ================================
 
-process.on('unhandledRejection', (reason) => {
-  console.error('Unhandled Rejection:', reason);
+client.login(TOKEN).catch(error => {
+  console.error('Discord login failed:', error);
 });
-
-client.login(TOKEN);
