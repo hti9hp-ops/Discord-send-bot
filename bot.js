@@ -160,7 +160,7 @@ const client = new Client({
 
 let cachedConfig = null;
 let lastPanelSignature = '';
-let lastPanelMessageId = null;
+let lastPanelMessageIds = [];
 
 // channel_id -> ticket data
 const activeTickets = new Map();
@@ -752,66 +752,73 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
 }
 
 // ================================
-// PANEL (SEPARATE SECTIONS PER TYPE)
+// PANEL (EACH TYPE IN ITS OWN MESSAGE WITH ITS OWN BUTTON)
 // ================================
 
-function buildPanelPayload() {
+function buildPanelMessages() {
   const cfg = cachedConfig || {};
   const types = cfg.ticketTypes || [];
+  const messages = [];
 
-  const blocks = [];
-
-  if (cfg.panelDescription) {
-    blocks.push(cfg.panelDescription.trim());
-  }
-
-  for (const type of types) {
-    const title = type.sectionTitle ? `### ${type.sectionTitle.trim()}` : '';
-    const desc = type.sectionDescription ? type.sectionDescription.trim() : '';
-    const btnHint = type.buttonLabel ? `🔘 **${type.buttonLabel.trim()}**` : '';
-    const sectionBlock = [title, desc, btnHint].filter(Boolean).join('\n');
-
-    if (sectionBlock) {
-      blocks.push(`────────────────────\n${sectionBlock}`);
-    }
-  }
-
-  const fullDescription = (blocks.join('\n\n') || 'اختر نوع الشكوى من الأزرار أدناه.').slice(0, 4096);
-
-  const embed = new EmbedBuilder()
+  const headerEmbed = new EmbedBuilder()
     .setColor(0x5865F2)
     .setTitle((cfg.panelTitle || 'نظام الشكاوى').slice(0, 256))
-    .setDescription(fullDescription);
+    .setDescription((cfg.panelDescription || 'اختر نوع الشكوى من الأزرار أدناه.').slice(0, 4096));
 
   if (cfg.panelImageUrl && /^https?:\/\//i.test(cfg.panelImageUrl.trim())) {
-    embed.setImage(cfg.panelImageUrl.trim());
+    headerEmbed.setImage(cfg.panelImageUrl.trim());
   }
 
-  const rows = [];
-  let currentRow = new ActionRowBuilder();
+  messages.push({
+    embeds: [headerEmbed],
+    components: []
+  });
 
   for (const type of types) {
-    const button = new ButtonBuilder()
-      .setCustomId(`open_ticket_type:${type.id}`)
-      .setLabel((type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80))
-      .setStyle(mapButtonStyle(type.buttonStyle));
+    const sectionEmbed = new EmbedBuilder()
+      .setColor(mapButtonStyle(type.buttonStyle) === ButtonStyle.Danger ? 0xDA373C : (mapButtonStyle(type.buttonStyle) === ButtonStyle.Success ? 0x23A55A : 0x5865F2))
+      .setTitle((type.sectionTitle || type.buttonLabel || 'قسم شكوى').slice(0, 256))
+      .setDescription((type.sectionDescription || 'اضغط على الزر أدناه لفتح التذكرة.').slice(0, 4096));
 
-    if (currentRow.components.length >= 5) {
-      rows.push(currentRow);
-      currentRow = new ActionRowBuilder();
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`open_ticket_type:${type.id}`)
+        .setLabel((type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80))
+        .setStyle(mapButtonStyle(type.buttonStyle))
+    );
+
+    messages.push({
+      embeds: [sectionEmbed],
+      components: [row]
+    });
+  }
+
+  return messages;
+}
+
+async function deleteTrackedPanelMessages(channel) {
+  for (const msgId of lastPanelMessageIds) {
+    const msg = await channel.messages.fetch(msgId).catch(() => null);
+    if (msg) {
+      await msg.delete().catch(() => null);
     }
+  }
+  lastPanelMessageIds = [];
+}
 
-    currentRow.addComponents(button);
+async function sendPanelMessagesToChannel(channel) {
+  await deleteTrackedPanelMessages(channel);
+  const payloads = buildPanelMessages();
+  const sentIds = [];
+
+  for (const payload of payloads) {
+    const sent = await channel.send(payload);
+    sentIds.push(sent.id);
   }
 
-  if (currentRow.components.length) {
-    rows.push(currentRow);
-  }
-
-  return {
-    embeds: [embed],
-    components: rows
-  };
+  lastPanelMessageIds = sentIds;
+  lastPanelSignature = JSON.stringify(payloads);
+  return sentIds;
 }
 
 async function ensurePanelChannel(guild) {
@@ -821,41 +828,32 @@ async function ensurePanelChannel(guild) {
   const channel = await guild.channels.fetch(channelId).catch(() => null);
   if (!channel || !channel.isTextBased()) return;
 
-  const payload = buildPanelPayload();
-  const signature = JSON.stringify(payload);
+  const payloads = buildPanelMessages();
+  const signature = JSON.stringify(payloads);
 
-  if (signature === lastPanelSignature && lastPanelMessageId) {
+  if (signature === lastPanelSignature && lastPanelMessageIds.length > 0) {
     return;
   }
 
-  if (lastPanelMessageId) {
-    const oldMessage = await channel.messages
-      .fetch(lastPanelMessageId)
-      .catch(() => null);
-
-    if (oldMessage) {
-      await oldMessage.edit(payload).catch(() => null);
+  if (lastPanelMessageIds.length === payloads.length) {
+    let allEdited = true;
+    for (let i = 0; i < payloads.length; i++) {
+      const msg = await channel.messages.fetch(lastPanelMessageIds[i]).catch(() => null);
+      if (!msg) {
+        allEdited = false;
+        break;
+      }
+      await msg.edit(payloads[i]).catch(() => {
+        allEdited = false;
+      });
+    }
+    if (allEdited) {
       lastPanelSignature = signature;
       return;
     }
   }
 
-  const recent = await channel.messages.fetch({ limit: 30 }).catch(() => null);
-
-  const existing = recent?.find(m =>
-    m.author.id === client.user.id &&
-    m.embeds[0]?.title === (cachedConfig.panelTitle || 'نظام الشكاوى')
-  );
-
-  if (existing) {
-    await existing.edit(payload).catch(() => null);
-    lastPanelMessageId = existing.id;
-  } else {
-    const sent = await channel.send(payload);
-    lastPanelMessageId = sent.id;
-  }
-
-  lastPanelSignature = signature;
+  await sendPanelMessagesToChannel(channel);
 }
 
 // ================================
@@ -1136,9 +1134,7 @@ client.on('interactionCreate', async interaction => {
           });
         }
 
-        const sent = await channel.send(buildPanelPayload());
-        lastPanelMessageId = sent.id;
-        lastPanelSignature = JSON.stringify(buildPanelPayload());
+        await sendPanelMessagesToChannel(channel);
 
         return interaction.reply({
           content: 'تم إرسال لوحة الشكاوى.',
