@@ -728,7 +728,6 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
     .setTimestamp();
 
   try {
-    // إرسال الإيمبد أولاً ثم ملف السجل تحته مباشرة
     await logChannel.send({
       embeds: [embed],
       allowedMentions: { parse: [] }
@@ -857,6 +856,22 @@ function isStaffMember(member, ticketType) {
 
   return staffRoles.some(roleId => member.roles.cache.has(roleId)) ||
     member.permissions.has(PermissionFlagsBits.Administrator);
+}
+
+async function setStaffSendPermission(channel, ticketType, canSend) {
+  if (!channel || !ticketType) return;
+
+  for (const roleId of (ticketType.staffRoleIds || [])) {
+    await channel.permissionOverwrites.edit(roleId, {
+      ViewChannel: true,
+      SendMessages: canSend,
+      ReadMessageHistory: true,
+      AttachFiles: canSend,
+      EmbedLinks: canSend
+    }).catch(error => {
+      console.error('Could not update staff role permission:', error);
+    });
+  }
 }
 
 // ================================
@@ -1179,7 +1194,7 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
-      // Claim ticket
+      // Claim ticket & enable staff writing
       if (interaction.customId === 'claim_ticket') {
         const ticket = await getTicket(interaction.channelId);
 
@@ -1222,8 +1237,10 @@ client.on('interactionCreate', async interaction => {
           interaction.channelId,
           interaction.user,
           'استلام الشكوى',
-          'تم استلام الشكوى من قبل الإدارة'
+          'تم استلام الشكوى من قبل الإدارة وتفعيل الكتابة للإدارة'
         );
+
+        await setStaffSendPermission(interaction.channel, type, true);
 
         activeTickets.set(interaction.channelId, {
           ...ticket,
@@ -1233,7 +1250,7 @@ client.on('interactionCreate', async interaction => {
         });
 
         return interaction.reply({
-          content: `تم استلام الشكوى بواسطة <@${interaction.user.id}>.`,
+          content: `تم استلام الشكوى بواسطة <@${interaction.user.id}> وتم تفعيل الكتابة للإدارة.`,
           allowedMentions: { users: [interaction.user.id] }
         });
       }
@@ -1363,7 +1380,7 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.isModalSubmit()) {
 
-      // Submit new ticket
+      // Submit new ticket (staff cannot write until claimed; owner can write immediately)
       if (interaction.customId.startsWith('submit_ticket:')) {
         await interaction.deferReply({ ephemeral: true });
 
@@ -1402,52 +1419,57 @@ client.on('interactionCreate', async interaction => {
           .replace(/[^a-z0-9]/g, '')
           .slice(0, 12) || 'user';
 
+        const permissionOverwrites = [
+          {
+            id: interaction.guild.id,
+            deny: [PermissionFlagsBits.ViewChannel]
+          },
+          {
+            id: interaction.user.id,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory,
+              PermissionFlagsBits.AttachFiles,
+              PermissionFlagsBits.EmbedLinks
+            ]
+          },
+          {
+            id: client.user.id,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.ReadMessageHistory,
+              PermissionFlagsBits.ManageChannels,
+              PermissionFlagsBits.AttachFiles,
+              PermissionFlagsBits.EmbedLinks
+            ]
+          }
+        ];
+
+        for (const roleId of (type.staffRoleIds || [])) {
+          permissionOverwrites.push({
+            id: roleId,
+            allow: [
+              PermissionFlagsBits.ViewChannel,
+              PermissionFlagsBits.ReadMessageHistory
+            ],
+            deny: [
+              PermissionFlagsBits.SendMessages,
+              PermissionFlagsBits.AttachFiles,
+              PermissionFlagsBits.EmbedLinks
+            ]
+          });
+        }
+
         const channel = await interaction.guild.channels.create({
           name: `شكوى-${ticketNumber}-${safeName}`.slice(0, 95),
           type: ChannelType.GuildText,
           parent: category?.type === ChannelType.GuildCategory
             ? category.id
             : undefined,
-          permissionOverwrites: [
-            {
-              id: interaction.guild.id,
-              deny: [PermissionFlagsBits.ViewChannel]
-            },
-            {
-              id: interaction.user.id,
-              allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ReadMessageHistory,
-                PermissionFlagsBits.AttachFiles,
-                PermissionFlagsBits.EmbedLinks
-              ]
-            },
-            {
-              id: client.user.id,
-              allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.SendMessages,
-                PermissionFlagsBits.ReadMessageHistory,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.AttachFiles,
-                PermissionFlagsBits.EmbedLinks
-              ]
-            }
-          ]
+          permissionOverwrites
         });
-
-        for (const roleId of (type.staffRoleIds || [])) {
-          await channel.permissionOverwrites.edit(roleId, {
-            ViewChannel: true,
-            SendMessages: true,
-            ReadMessageHistory: true,
-            AttachFiles: true,
-            EmbedLinks: true
-          }).catch(error => {
-            console.error('Could not add staff role permission:', error);
-          });
-        }
 
         await pool.query(`
           INSERT INTO tickets (
@@ -1588,7 +1610,6 @@ client.on('interactionCreate', async interaction => {
 
         activeTickets.set(interaction.channelId, updatedTicket);
 
-        // منع صاحب الشكوى من الكتابة في الروم مع بقاء الروم موجوداً
         if (interaction.channel && ticket.user_id) {
           await interaction.channel.permissionOverwrites.edit(ticket.user_id, {
             SendMessages: false
