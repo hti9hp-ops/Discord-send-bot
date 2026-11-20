@@ -1238,7 +1238,7 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      // Record ticket and delete channel after 5 seconds
+      // Record ticket (only after closing) and delete channel after 5 seconds
       if (interaction.customId === 'record_ticket') {
         const ticket = await getTicket(interaction.channelId);
 
@@ -1254,6 +1254,13 @@ client.on('interactionCreate', async interaction => {
         if (!isStaffMember(interaction.member, type)) {
           return interaction.reply({
             content: 'ليس لديك صلاحية تسجيل الشكوى.',
+            ephemeral: true
+          });
+        }
+
+        if (ticket.status !== 'closed') {
+          return interaction.reply({
+            content: 'تعذر عليك إغلاق الشكوى أولاً',
             ephemeral: true
           });
         }
@@ -1303,13 +1310,20 @@ client.on('interactionCreate', async interaction => {
         return;
       }
 
-      // Close ticket
+      // Close ticket (staff only, ticket owner cannot close)
       if (interaction.customId === 'close_ticket') {
         const ticket = await getTicket(interaction.channelId);
 
         if (!ticket || ticket.status !== 'open') {
           return interaction.reply({
             content: 'هذه الشكوى مغلقة أو غير موجودة.',
+            ephemeral: true
+          });
+        }
+
+        if (interaction.user.id === ticket.user_id) {
+          return interaction.reply({
+            content: 'لا يمكنك إغلاق الشكوى، الإغلاق مخصص للإدارة فقط.',
             ephemeral: true
           });
         }
@@ -1532,7 +1546,7 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      // Close reason modal
+      // Close reason modal (keep channel, block owner from sending messages)
       if (interaction.customId === 'close_ticket_reason') {
         await interaction.deferReply({ ephemeral: true });
 
@@ -1540,6 +1554,10 @@ client.on('interactionCreate', async interaction => {
 
         if (!ticket || ticket.status !== 'open') {
           return interaction.editReply('هذه الشكوى مغلقة مسبقاً أو غير موجودة.');
+        }
+
+        if (interaction.user.id === ticket.user_id) {
+          return interaction.editReply('لا يمكنك إغلاق الشكوى، الإغلاق مخصص للإدارة فقط.');
         }
 
         const reason = interaction.fields.getTextInputValue('close_reason');
@@ -1570,6 +1588,15 @@ client.on('interactionCreate', async interaction => {
 
         activeTickets.set(interaction.channelId, updatedTicket);
 
+        // منع صاحب الشكوى من الكتابة في الروم مع بقاء الروم موجوداً
+        if (interaction.channel && ticket.user_id) {
+          await interaction.channel.permissionOverwrites.edit(ticket.user_id, {
+            SendMessages: false
+          }).catch(err => {
+            console.error('Could not block ticket owner from sending messages:', err);
+          });
+        }
+
         const archiveSent = await sendArchiveToLogChannel(
           interaction.guild,
           interaction.channelId,
@@ -1578,8 +1605,8 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.editReply(
           archiveSent
-            ? 'تم إغلاق الشكوى وإرسال الأرشيف النهائي.'
-            : 'تم إغلاق الشكوى، لكن تعذر إرسال الأرشيف. راجع إعدادات روم السجل.'
+            ? 'تم إغلاق الشكوى ومنع صاحبها من الكتابة، وتم إرسال الأرشيف النهائي.'
+            : 'تم إغلاق الشكوى ومنع صاحبها من الكتابة، لكن تعذر إرسال الأرشيف. راجع إعدادات روم السجل.'
         );
 
         await interaction.channel.send({
@@ -1589,13 +1616,12 @@ client.on('interactionCreate', async interaction => {
               .setTitle('تم إغلاق الشكوى')
               .setDescription(
                 `**بواسطة:** <@${interaction.user.id}>\n` +
-                `**السبب:** ${reason}`
+                `**السبب:** ${reason}\n` +
+                `تم تعطيل الكتابة لصاحب الشكوى، والروم جاهز للتسجيل.`
               )
               .setTimestamp()
           ]
         });
-
-        activeTickets.delete(interaction.channelId);
 
         return;
       }
