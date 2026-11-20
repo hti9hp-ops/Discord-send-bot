@@ -42,7 +42,7 @@ const commands = [
       option
         .setName('channel')
         .setDescription('اختر الشات الذي تريد إرسال الرسالة إليه')
-        .addChannelTypes(ChannelType.GuildText)
+        .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
         .setRequired(true)
     )
     .addStringOption((option) =>
