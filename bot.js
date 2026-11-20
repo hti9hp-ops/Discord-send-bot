@@ -752,27 +752,46 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
 }
 
 // ================================
-// PANEL
+// PANEL (MATCHES DASHBOARD PREVIEW)
 // ================================
 
 function buildPanelPayload() {
   const cfg = cachedConfig || {};
+  const types = cfg.ticketTypes || [];
+
+  const sectionsText = types
+    .map(t => {
+      const title = t.sectionTitle ? `**${t.sectionTitle}**` : '';
+      const desc = t.sectionDescription ? `${t.sectionDescription}` : '';
+      return [title, desc].filter(Boolean).join('\n');
+    })
+    .filter(Boolean)
+    .join('\n\n────────────────────\n\n');
+
+  const fullDescription = [
+    cfg.panelDescription || 'اختر نوع الشكوى من الأزرار أدناه.',
+    sectionsText ? `\n────────────────────\n\n${sectionsText}` : ''
+  ]
+    .filter(Boolean)
+    .join('\n')
+    .slice(0, 4096);
+
   const embed = new EmbedBuilder()
     .setColor(0x5865F2)
-    .setTitle(cfg.panelTitle || 'نظام الشكاوى')
-    .setDescription(cfg.panelDescription || 'اختر نوع الشكوى من الأزرار أدناه.');
+    .setTitle((cfg.panelTitle || 'نظام الشكاوى').slice(0, 256))
+    .setDescription(fullDescription);
 
-  if (cfg.panelImageUrl && /^https?:\/\//i.test(cfg.panelImageUrl)) {
-    embed.setImage(cfg.panelImageUrl);
+  if (cfg.panelImageUrl && /^https?:\/\//i.test(cfg.panelImageUrl.trim())) {
+    embed.setImage(cfg.panelImageUrl.trim());
   }
 
   const rows = [];
   let currentRow = new ActionRowBuilder();
 
-  for (const type of (cfg.ticketTypes || [])) {
+  for (const type of types) {
     const button = new ButtonBuilder()
       .setCustomId(`open_ticket_type:${type.id}`)
-      .setLabel(type.buttonLabel || type.sectionTitle || 'فتح شكوى')
+      .setLabel((type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80))
       .setStyle(mapButtonStyle(type.buttonStyle));
 
     if (currentRow.components.length >= 5) {
@@ -899,7 +918,7 @@ async function registerCommands() {
 // STARTUP
 // ================================
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   try {
