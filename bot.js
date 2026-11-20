@@ -752,29 +752,31 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
 }
 
 // ================================
-// PANEL (MATCHES DASHBOARD PREVIEW)
+// PANEL (SEPARATE SECTIONS PER TYPE)
 // ================================
 
 function buildPanelPayload() {
   const cfg = cachedConfig || {};
   const types = cfg.ticketTypes || [];
 
-  const sectionsText = types
-    .map(t => {
-      const title = t.sectionTitle ? `**${t.sectionTitle}**` : '';
-      const desc = t.sectionDescription ? `${t.sectionDescription}` : '';
-      return [title, desc].filter(Boolean).join('\n');
-    })
-    .filter(Boolean)
-    .join('\n\n────────────────────\n\n');
+  const blocks = [];
 
-  const fullDescription = [
-    cfg.panelDescription || 'اختر نوع الشكوى من الأزرار أدناه.',
-    sectionsText ? `\n────────────────────\n\n${sectionsText}` : ''
-  ]
-    .filter(Boolean)
-    .join('\n')
-    .slice(0, 4096);
+  if (cfg.panelDescription) {
+    blocks.push(cfg.panelDescription.trim());
+  }
+
+  for (const type of types) {
+    const title = type.sectionTitle ? `### ${type.sectionTitle.trim()}` : '';
+    const desc = type.sectionDescription ? type.sectionDescription.trim() : '';
+    const btnHint = type.buttonLabel ? `🔘 **${type.buttonLabel.trim()}**` : '';
+    const sectionBlock = [title, desc, btnHint].filter(Boolean).join('\n');
+
+    if (sectionBlock) {
+      blocks.push(`────────────────────\n${sectionBlock}`);
+    }
+  }
+
+  const fullDescription = (blocks.join('\n\n') || 'اختر نوع الشكوى من الأزرار أدناه.').slice(0, 4096);
 
   const embed = new EmbedBuilder()
     .setColor(0x5865F2)
