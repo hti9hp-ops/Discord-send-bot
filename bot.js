@@ -187,6 +187,21 @@ function formatDate(value) {
   });
 }
 
+function formatTicketDescription(ticket) {
+  const answers = Array.isArray(ticket?.answers) ? ticket.answers : [];
+  if (!answers.length) return 'غير متوفر';
+
+  return answers
+    .map(a => `**${a.label || 'سؤال'}:** ${a.value || 'بدون إجابة'}`)
+    .join('\n');
+}
+
+function truncateText(text, maxLength = 950) {
+  const str = String(text || '');
+  if (str.length <= maxLength) return str;
+  return str.slice(0, maxLength - 3) + '...';
+}
+
 function mapButtonStyle(style) {
   const styles = {
     Success: ButtonStyle.Success,
@@ -526,6 +541,7 @@ small {
 <p>نوع الشكوى: ${escapeHtml(t.type_name || '')}</p>
 <p>الحالة: ${escapeHtml(t.status)}</p>
 <p>تاريخ الفتح: ${escapeHtml(formatDate(t.created_at))}</p>
+<p>وقت الاستلام: ${escapeHtml(formatDate(t.claimed_at))}</p>
 <p>تاريخ الإغلاق: ${escapeHtml(formatDate(t.closed_at))}</p>
 <p>المستلم: ${escapeHtml(t.claimed_by_tag || 'لم يتم الاستلام')}</p>
 <p>المغلق بواسطة: ${escapeHtml(t.closed_by_tag || 'لم تغلق')}</p>
@@ -560,6 +576,7 @@ function generateArchiveTxt(data) {
   lines.push(`نوع الشكوى: ${t.type_name || ''}`);
   lines.push(`الحالة: ${t.status}`);
   lines.push(`تاريخ الفتح: ${formatDate(t.created_at)}`);
+  lines.push(`وقت الاستلام: ${formatDate(t.claimed_at)}`);
   lines.push(`تاريخ الإغلاق: ${formatDate(t.closed_at)}`);
   lines.push(`المستلم: ${t.claimed_by_tag || 'لم يتم الاستلام'}`);
   lines.push(`المغلق بواسطة: ${t.closed_by_tag || 'لم تغلق'}`);
@@ -623,6 +640,10 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
     return false;
   }
 
+  if (!cachedConfig?.logChannelId) {
+    await fetchRemoteState();
+  }
+
   const logChannelId = cachedConfig?.logChannelId;
 
   if (!logChannelId) {
@@ -637,10 +658,11 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
     return false;
   }
 
+  const t = data.ticket;
+  const number = t.ticket_number;
+
   const html = generateArchiveHtml(data);
   const txt = generateArchiveTxt(data);
-
-  const number = data.ticket.ticket_number;
 
   const files = [
     new AttachmentBuilder(
@@ -654,19 +676,66 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
   ];
 
   const embed = new EmbedBuilder()
-    .setColor(data.ticket.status === 'closed' ? 0xDA373C : 0x5865F2)
-    .setTitle(`أرشيف الشكوى #${number}`)
-    .setDescription(
-      `**صاحب الشكوى:** <@${data.ticket.user_id}>\n` +
-      `**النوع:** ${data.ticket.type_name || 'غير محدد'}\n` +
-      `**الحالة:** ${data.ticket.status}\n` +
-      `**نوع الأرشيف:** ${label}`
+    .setColor(t.status === 'closed' ? 0xDA373C : 0x5865F2)
+    .setTitle(`سجل الشكوى #${number}`)
+    .addFields(
+      {
+        name: 'صاحب الشكوى',
+        value: t.user_id ? `<@${t.user_id}> (${t.user_tag || ''})` : (t.user_tag || 'غير متوفر'),
+        inline: true
+      },
+      {
+        name: 'نوع الشكوى',
+        value: t.type_name || 'غير محدد',
+        inline: true
+      },
+      {
+        name: 'تاريخ الشكوى',
+        value: formatDate(t.created_at),
+        inline: true
+      },
+      {
+        name: 'مستلم الشكوى',
+        value: t.claimed_by ? `<@${t.claimed_by}>` : 'لم يتم الاستلام',
+        inline: true
+      },
+      {
+        name: 'وقت الاستلام',
+        value: formatDate(t.claimed_at),
+        inline: true
+      },
+      {
+        name: 'اللي غلق الشكوى',
+        value: t.closed_by ? `<@${t.closed_by}>` : 'لم تُغلق بعد',
+        inline: true
+      },
+      {
+        name: 'وقت الإغلاق',
+        value: formatDate(t.closed_at),
+        inline: true
+      },
+      {
+        name: 'نوع السجل',
+        value: label || 'سجل التذكرة',
+        inline: true
+      },
+      {
+        name: 'وصف الشكوى',
+        value: truncateText(formatTicketDescription(t), 1024),
+        inline: false
+      }
     )
     .setTimestamp();
 
   try {
+    // إرسال الإيمبد أولاً ثم ملف السجل تحته مباشرة
     await logChannel.send({
       embeds: [embed],
+      allowedMentions: { parse: [] }
+    });
+
+    await logChannel.send({
+      content: `📄 **ملف السجل للشكوى #${number}:**`,
       files,
       allowedMentions: { parse: [] }
     });
@@ -774,7 +843,11 @@ async function ensurePanelChannel(guild) {
 // ================================
 
 function isStaffMember(member, ticketType) {
-  if (!member || !ticketType) return false;
+  if (!member) return false;
+
+  if (!ticketType) {
+    return member.permissions.has(PermissionFlagsBits.Administrator);
+  }
 
   const staffRoles = ticketType.staffRoleIds || [];
 
@@ -1155,7 +1228,8 @@ client.on('interactionCreate', async interaction => {
         activeTickets.set(interaction.channelId, {
           ...ticket,
           claimed_by: interaction.user.id,
-          claimed_by_tag: interaction.user.tag
+          claimed_by_tag: interaction.user.tag,
+          claimed_at: new Date().toISOString()
         });
 
         return interaction.reply({
@@ -1164,7 +1238,7 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      // Save archive snapshot
+      // Record ticket and delete channel after 5 seconds
       if (interaction.customId === 'record_ticket') {
         const ticket = await getTicket(interaction.channelId);
 
@@ -1186,17 +1260,47 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.deferReply({ ephemeral: true });
 
+        await addStaffAction(
+          interaction.channelId,
+          interaction.user,
+          'تسجيل التذكرة',
+          'تم إرسال سجل التذكرة وجدولة حذف الروم بعد 5 ثواني'
+        );
+
         const sent = await sendArchiveToLogChannel(
           interaction.guild,
           interaction.channelId,
-          'نسخة أرشيف'
+          'تسجيل التذكرة'
         );
 
-        return interaction.editReply(
-          sent
-            ? 'تم إرسال نسخة الأرشيف إلى روم السجل.'
-            : 'تعذر إرسال الأرشيف. تحقق من روم السجل وصلاحيات البوت.'
+        if (!sent) {
+          return interaction.editReply(
+            'تعذر إرسال سجل التذكرة. تحقق من روم السجل وصلاحيات البوت.'
+          );
+        }
+
+        await interaction.editReply(
+          'تم إرسال سجل التذكرة إلى الروم المحدد، وسيتم حذف الروم بعد 5 ثواني.'
         );
+
+        const targetChannel = interaction.channel;
+        if (targetChannel) {
+          await targetChannel.send({
+            content: '✅ تم تسجيل التذكرة وإرسال السجل، سيتم حذف هذا الروم خلال **5 ثواني**...'
+          }).catch(() => {});
+
+          activeTickets.delete(interaction.channelId);
+
+          setTimeout(async () => {
+            try {
+              await targetChannel.delete('تم تسجيل التذكرة وحذف الروم بعد 5 ثواني');
+            } catch (err) {
+              console.error('Channel delete after record error:', err);
+            }
+          }, 5000);
+        }
+
+        return;
       }
 
       // Close ticket
@@ -1391,7 +1495,7 @@ client.on('interactionCreate', async interaction => {
 
           new ButtonBuilder()
             .setCustomId('record_ticket')
-            .setLabel('تسجيل الأرشيف')
+            .setLabel('تسجيل التذكرة')
             .setStyle(ButtonStyle.Secondary),
 
           new ButtonBuilder()
