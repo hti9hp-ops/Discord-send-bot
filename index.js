@@ -25,6 +25,11 @@ const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
 
+if (!TOKEN) {
+  console.error('TOKEN is missing in environment variables!');
+  process.exit(1);
+}
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
@@ -51,7 +56,7 @@ const commands = [
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`البوت شغال باسم: ${readyClient.user.tag}`);
 
-  if (TOKEN && CLIENT_ID && GUILD_ID) {
+  if (CLIENT_ID && GUILD_ID) {
     const rest = new REST({ version: '10' }).setToken(TOKEN);
     try {
       await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
@@ -69,20 +74,28 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const targetChannel = interaction.options.getChannel('channel');
     const messageText = interaction.options.getString('message');
 
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
     try {
       await targetChannel.send({ content: messageText });
-      await interaction.reply({
+      await interaction.editReply({
         content: `تم إرسال رسالتك إلى <#${targetChannel.id}>`,
-        flags: MessageFlags.Ephemeral,
       });
     } catch (err) {
       console.error(err);
-      await interaction.reply({
+      await interaction.editReply({
         content: 'تعذر الإرسال، تأكد من صلاحيات البوت في هذا الشات.',
-        flags: MessageFlags.Ephemeral,
       });
     }
   }
+});
+
+client.on('error', (err) => {
+  console.error('Discord client error:', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
 });
 
 client.login(TOKEN);
