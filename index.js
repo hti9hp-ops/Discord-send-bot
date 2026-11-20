@@ -54,12 +54,48 @@ async function getConfig() {
     const res = await fetch(CONFIG_URL);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    cachedConfig = data || {};
+    const cfg = data && data.config ? data.config : data || {};
+    cachedConfig = cfg;
     lastFetch = now;
     return cachedConfig;
   } catch (err) {
     console.error('خطأ بجلب الإعدادات من CONFIG_URL:', err);
     return cachedConfig || {};
+  }
+}
+
+async function syncGuildMeta(guild) {
+  if (!CONFIG_URL || !guild) return;
+  try {
+    await guild.channels.fetch();
+    await guild.roles.fetch();
+
+    const categories = guild.channels.cache
+      .filter((c) => c.type === ChannelType.GuildCategory)
+      .map((c) => ({ id: c.id, name: c.name }));
+
+    const channels = guild.channels.cache
+      .filter((c) => c.type === ChannelType.GuildText || c.type === ChannelType.GuildAnnouncement)
+      .map((c) => ({ id: c.id, name: c.name }));
+
+    const roles = guild.roles.cache
+      .filter((r) => r.id !== guild.id && !r.managed)
+      .sort((a, b) => b.position - a.position)
+      .map((r) => ({ id: r.id, name: r.name }));
+
+    await fetch(CONFIG_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'sync_meta',
+        categories,
+        channels,
+        roles,
+      }),
+    });
+    console.log('تم مزامنة الشاتات والكاتكوريات والرولات مع لوحة التحكم.');
+  } catch (err) {
+    console.error('خطأ بمزامنة بيانات السيرفر:', err);
   }
 }
 
@@ -107,6 +143,12 @@ client.once(Events.ClientReady, async (readyClient) => {
       console.log('تم تسجيل الأوامر بنجاح!');
     } catch (error) {
       console.error('خطأ أثناء تسجيل الأوامر:', error);
+    }
+
+    const guild = readyClient.guilds.cache.get(GUILD_ID) || (await readyClient.guilds.fetch(GUILD_ID).catch(() => null));
+    if (guild) {
+      await syncGuildMeta(guild);
+      setInterval(() => syncGuildMeta(guild), 5 * 60 * 1000);
     }
   }
 });
