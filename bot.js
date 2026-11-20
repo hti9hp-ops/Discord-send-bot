@@ -12,6 +12,13 @@ const {
   AttachmentBuilder,
   ChannelType,
   PermissionFlagsBits,
+  MessageFlags,
+  ContainerBuilder,
+  TextDisplayBuilder,
+  SeparatorBuilder,
+  SeparatorSpacingSize,
+  MediaGalleryBuilder,
+  MediaGalleryItemBuilder,
   REST,
   Routes,
   SlashCommandBuilder
@@ -752,33 +759,59 @@ async function sendArchiveToLogChannel(guild, channelId, label) {
 }
 
 // ================================
-// PANEL (EACH TYPE IN ITS OWN MESSAGE WITH ITS OWN BUTTON)
+// PANEL (SINGLE UNIFIED CARD WITH SECTION + DESCRIPTION + BUTTON PER TYPE)
 // ================================
 
 function buildPanelMessages() {
   const cfg = cachedConfig || {};
   const types = cfg.ticketTypes || [];
-  const messages = [];
 
-  const headerEmbed = new EmbedBuilder()
-    .setColor(0x5865F2)
-    .setTitle((cfg.panelTitle || 'نظام الشكاوى').slice(0, 256))
-    .setDescription((cfg.panelDescription || 'اختر نوع الشكوى من الأزرار أدناه.').slice(0, 4096));
+  const container = new ContainerBuilder();
 
   if (cfg.panelImageUrl && /^https?:\/\//i.test(cfg.panelImageUrl.trim())) {
-    headerEmbed.setImage(cfg.panelImageUrl.trim());
+    const gallery = new MediaGalleryBuilder().addItems(
+      new MediaGalleryItemBuilder().setURL(cfg.panelImageUrl.trim())
+    );
+    container.addMediaGalleryComponents(gallery);
   }
 
-  messages.push({
-    embeds: [headerEmbed],
-    components: []
-  });
+  const headerParts = [];
+  if (cfg.panelTitle) {
+    headerParts.push(`## ${cfg.panelTitle.trim()}`);
+  } else {
+    headerParts.push('## إنشاء تذكرة');
+  }
 
-  for (const type of types) {
-    const sectionEmbed = new EmbedBuilder()
-      .setColor(mapButtonStyle(type.buttonStyle) === ButtonStyle.Danger ? 0xDA373C : (mapButtonStyle(type.buttonStyle) === ButtonStyle.Success ? 0x23A55A : 0x5865F2))
-      .setTitle((type.sectionTitle || type.buttonLabel || 'قسم شكوى').slice(0, 256))
-      .setDescription((type.sectionDescription || 'اضغط على الزر أدناه لفتح التذكرة.').slice(0, 4096));
+  if (cfg.panelDescription && cfg.panelDescription.trim()) {
+    headerParts.push(cfg.panelDescription.trim());
+  }
+
+  container.addTextDisplayComponents(
+    new TextDisplayBuilder().setContent(headerParts.join('\n'))
+  );
+
+  for (let i = 0; i < types.length; i++) {
+    const type = types[i];
+
+    container.addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small)
+    );
+
+    const sectionLines = [];
+    if (type.sectionTitle) {
+      sectionLines.push(`### ${type.sectionTitle.trim()}`);
+    }
+    if (type.sectionDescription) {
+      sectionLines.push(type.sectionDescription.trim());
+    }
+
+    if (sectionLines.length) {
+      container.addTextDisplayComponents(
+        new TextDisplayBuilder().setContent(sectionLines.join('\n'))
+      );
+    }
 
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
@@ -787,13 +820,27 @@ function buildPanelMessages() {
         .setStyle(mapButtonStyle(type.buttonStyle))
     );
 
-    messages.push({
-      embeds: [sectionEmbed],
-      components: [row]
-    });
+    container.addActionRowComponents(row);
   }
 
-  return messages;
+  const extraNotes = cfg.panelNotes || cfg.panelRules || cfg.rulesText || '';
+  if (extraNotes && String(extraNotes).trim()) {
+    container.addSeparatorComponents(
+      new SeparatorBuilder()
+        .setDivider(true)
+        .setSpacing(SeparatorSpacingSize.Small)
+    );
+    container.addTextDisplayComponents(
+      new TextDisplayBuilder().setContent(`\`\`\`\n${String(extraNotes).trim()}\n\`\`\``)
+    );
+  }
+
+  return [
+    {
+      components: [container],
+      flags: MessageFlags.IsComponentsV2
+    }
+  ];
 }
 
 async function deleteTrackedPanelMessages(channel) {
