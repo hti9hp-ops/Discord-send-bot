@@ -1,11 +1,13 @@
 {
-  "name": "discord-send-bot",
+  "name": "os-shop-ticket-bot",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Discord ticket system with PostgreSQL archives",
+  "main": "bot.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "discord.js": "^14.16.3"
+    "discord.js": "^14.25.1",
+    "pg": "^8.16.3"
   }
 }
