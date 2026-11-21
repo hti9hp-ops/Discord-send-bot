@@ -4,7 +4,7 @@ const {
   Client, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder,
   ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder,
   AttachmentBuilder, ChannelType, PermissionFlagsBits, MessageFlags, REST, Routes,
-  SlashCommandBuilder
+  SlashCommandBuilder, RoleSelectMenuBuilder, UserSelectMenuBuilder
 } = require('discord.js');
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
@@ -81,6 +81,12 @@ function normalizeTicketType(rawType) {
     t.escalateEnabled ??
     false
   );
+  const addEnabled = Boolean(
+    t.addMemberEnabled ??
+    t.addButtonEnabled ??
+    t.allowAddMembers ??
+    false
+  );
 
   return {
     ...t,
@@ -96,6 +102,7 @@ function normalizeTicketType(rawType) {
     fields: Array.isArray(t.fields) ? t.fields : [],
     evidenceNote: String(t.evidenceNote || ''),
     escalateToOwnerEnabled: escalateEnabled,
+    addMemberEnabled: addEnabled,
     ownerRoleId: sanitizeSnowflake(t.ownerRoleId || t.ownerEscalationRoleId),
     ownerCategoryId: sanitizeSnowflake(t.ownerCategoryId || t.ownerEscalationCategoryId)
   };
@@ -785,6 +792,10 @@ function isOwnerEscalationEnabled(ticketType) {
   return Boolean(normalizeTicketType(ticketType).escalateToOwnerEnabled);
 }
 
+function isAddMemberEnabled(ticketType) {
+  return Boolean(normalizeTicketType(ticketType).addMemberEnabled);
+}
+
 function resolveOwnerEscalationTarget(ticketType) {
   const normType = normalizeTicketType(ticketType);
   const cfg = normalizeConfig(cachedConfig || {});
@@ -807,6 +818,15 @@ function buildTicketActionRow(ticketType) {
         .setCustomId('escalate_to_owner')
         .setLabel('تحويل إلى أونر')
         .setStyle(ButtonStyle.Primary)
+    );
+  }
+
+  if (isAddMemberEnabled(ticketType)) {
+    buttons.push(
+      new ButtonBuilder()
+        .setCustomId('add_ticket_target')
+        .setLabel('إضافة')
+        .setStyle(ButtonStyle.Secondary)
     );
   }
 
@@ -1493,6 +1513,80 @@ client.on('interactionCreate', async interaction => {
       }
     }
 
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith('add_ticket_roles:')) {
+      const channelId = interaction.customId.split(':')[1];
+      const ticket = await getTicket(channelId);
+
+      if (!ticket || ticket.status !== 'open' || !isStaffMember(interaction.member, ticket)) {
+        return interaction.reply(ephemeralReply({
+          content: 'لا تملك صلاحية إضافة رولات لهذه الشكوى.'
+        }));
+      }
+
+      const targetChannel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+      if (!targetChannel) {
+        return interaction.reply(ephemeralReply({
+          content: 'تعذر العثور على روم الشكوى.'
+        }));
+      }
+
+      for (const roleId of interaction.values) {
+        await targetChannel.permissionOverwrites.edit(roleId, {
+          ViewChannel: true,
+          SendMessages: true,
+          ReadMessageHistory: true,
+          AttachFiles: true
+        });
+      }
+
+      const mentions = interaction.values.map(id => `<@&${id}>`).join(' ');
+      await addStaffAction(channelId, `أضاف رولات للشكوى: ${mentions}`, interaction.user);
+      await targetChannel.send({
+        content: `➕ تمت إضافة الرولات التالية إلى الشكوى بواسطة <@${interaction.user.id}>: ${mentions}`
+      });
+
+      return interaction.reply(ephemeralReply({
+        content: `تمت إضافة الرولات بنجاح: ${mentions}`
+      }));
+    }
+
+    if (interaction.isUserSelectMenu() && interaction.customId.startsWith('add_ticket_users:')) {
+      const channelId = interaction.customId.split(':')[1];
+      const ticket = await getTicket(channelId);
+
+      if (!ticket || ticket.status !== 'open' || !isStaffMember(interaction.member, ticket)) {
+        return interaction.reply(ephemeralReply({
+          content: 'لا تملك صلاحية إضافة أعضاء لهذه الشكوى.'
+        }));
+      }
+
+      const targetChannel = await interaction.guild.channels.fetch(channelId).catch(() => null);
+      if (!targetChannel) {
+        return interaction.reply(ephemeralReply({
+          content: 'تعذر العثور على روم الشكوى.'
+        }));
+      }
+
+      for (const userId of interaction.values) {
+        await targetChannel.permissionOverwrites.edit(userId, {
+          ViewChannel: true,
+          SendMessages: true,
+          ReadMessageHistory: true,
+          AttachFiles: true
+        });
+      }
+
+      const mentions = interaction.values.map(id => `<@${id}>`).join(' ');
+      await addStaffAction(channelId, `أضاف أعضاء للشكوى: ${mentions}`, interaction.user);
+      await targetChannel.send({
+        content: `➕ تمت إضافة الأعضاء التالين إلى الشكوى بواسطة <@${interaction.user.id}>: ${mentions}`
+      });
+
+      return interaction.reply(ephemeralReply({
+        content: `تمت إضافة الأعضاء بنجاح: ${mentions}`
+      }));
+    }
+
     if (interaction.isButton()) {
       const [action, param] = interaction.customId.split(':');
 
@@ -1678,6 +1772,48 @@ client.on('interactionCreate', async interaction => {
           }));
         }
         return;
+      }
+
+      if (action === 'add_ticket_target') {
+        const ticket = await getTicket(interaction.channel.id);
+
+        if (!ticket || ticket.status !== 'open') {
+          return interaction.reply(ephemeralReply({
+            content: 'هذه الشكوى غير موجودة أو مغلقة.'
+          }));
+        }
+
+        if (!isAddMemberEnabled(ticket.type_config)) {
+          return interaction.reply(ephemeralReply({
+            content: 'زر الإضافة غير مفعّل لهذا النوع من الشكاوى.'
+          }));
+        }
+
+        if (!isStaffMember(interaction.member, ticket)) {
+          return interaction.reply(ephemeralReply({
+            content: 'هذا الإجراء متاح للرولات الإدارية فقط.'
+          }));
+        }
+
+        const roleSelect = new RoleSelectMenuBuilder()
+          .setCustomId(`add_ticket_roles:${interaction.channel.id}`)
+          .setPlaceholder('ابحث واختر الرولات لإضافتها للشكوى...')
+          .setMinValues(1)
+          .setMaxValues(10);
+
+        const userSelect = new UserSelectMenuBuilder()
+          .setCustomId(`add_ticket_users:${interaction.channel.id}`)
+          .setPlaceholder('ابحث واختر الأشخاص لإضافتهم للشكوى...')
+          .setMinValues(1)
+          .setMaxValues(10);
+
+        return interaction.reply(ephemeralReply({
+          content: 'اختر الرولات أو الأشخاص من القوائم أدناه لإضافتهم إلى الشكوى:',
+          components: [
+            new ActionRowBuilder().addComponents(roleSelect),
+            new ActionRowBuilder().addComponents(userSelect)
+          ]
+        }));
       }
 
       if (['claim_ticket', 'record_ticket', 'close_ticket'].includes(action)) {
