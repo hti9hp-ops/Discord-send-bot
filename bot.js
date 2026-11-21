@@ -1393,8 +1393,7 @@ client.once('ready', handleClientReady);
 
 client.on('guildMemberAdd', async member => {
   try {
-    const state = await fetchRemoteState().catch(() => null);
-    const cfg = state?.config || cachedConfig || {};
+    const cfg = cachedConfig || {};
 
     if (!cfg.welcomeEnabled || !cfg.welcomeChannelId) return;
 
@@ -1412,8 +1411,7 @@ client.on('guildMemberAdd', async member => {
 
 client.on('guildMemberRemove', async member => {
   try {
-    const state = await fetchRemoteState().catch(() => null);
-    const cfg = state?.config || cachedConfig || {};
+    const cfg = cachedConfig || {};
 
     if (!cfg.goodbyeEnabled || !cfg.goodbyeChannelId) return;
 
@@ -1563,10 +1561,6 @@ client.on('messageDelete', async message => {
 
 client.on('interactionCreate', async interaction => {
   try {
-    const state = await fetchRemoteState().catch(() => null);
-
-    if (state?.config) cachedConfig = state.config;
-
     const cfg = cachedConfig || {};
 
     if (interaction.isChatInputCommand()) {
