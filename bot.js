@@ -130,15 +130,6 @@ async function runWithLock(lockKey, fn) {
   }
 }
 
-function mapButtonStyleNumber(styleName) {
-  return ({
-    Primary: 1,
-    Secondary: 2,
-    Success: 3,
-    Danger: 4
-  })[styleName] || 1;
-}
-
 function mapButtonStyle(styleName) {
   return ({
     Success: ButtonStyle.Success,
@@ -351,129 +342,65 @@ async function syncGuildMeta(guild) {
   console.log('Discord channels, categories and roles synced.');
 }
 
-function buildV2PanelBody(config) {
-  const components = [];
+function buildEmbedPanelPayloads(config) {
+  const types = Array.isArray(config.ticketTypes) ? config.ticketTypes.slice(0, 25) : [];
 
-  if (config.panelImageUrl && /^https?:\/\//i.test(config.panelImageUrl.trim())) {
-    components.push({
-      type: 12,
-      items: [
-        {
-          media: { url: config.panelImageUrl.trim() }
-        }
-      ]
-    });
-  }
-
-  const titleText = `## ${String(config.panelTitle || 'إنشاء تذكرة').slice(0, 200)}`;
-  const descText = config.panelDescription ? `\n${String(config.panelDescription).slice(0, 1800)}` : '';
-  components.push({
-    type: 10,
-    content: `${titleText}${descText}`.slice(0, 2000)
-  });
-
-  const types = Array.isArray(config.ticketTypes) ? config.ticketTypes.slice(0, 10) : [];
-
-  for (let i = 0; i < types.length; i++) {
-    const type = normalizeTicketType(types[i]);
-
-    const sectionTitle = `### ${String(type.sectionTitle || `قسم #${i + 1}`).slice(0, 200)}`;
-    const sectionDesc = String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 1500);
-
-    components.push({
-      type: 10,
-      content: `${sectionTitle}\n${sectionDesc}`.slice(0, 2000)
-    });
-
-    components.push({
-      type: 1,
-      components: [
-        {
-          type: 2,
-          style: mapButtonStyleNumber(type.buttonStyle),
-          label: String(type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80),
-          custom_id: `open_ticket_type:${type.id}`
-        }
-      ]
-    });
-
-    if (i < types.length - 1 || Boolean(config.panelNotes)) {
-      components.push({
-        type: 14,
-        divider: true,
-        spacing: 1
-      });
-    }
-  }
-
-  if (config.panelNotes) {
-    components.push({
-      type: 10,
-      content: `**ملاحظات مهمة**\n${String(config.panelNotes).slice(0, 1500)}`.slice(0, 2000)
-    });
-  }
-
-  return {
-    flags: 32768,
-    components
-  };
-}
-
-function buildFallbackEmbedPanel(config) {
-  const embed = new EmbedBuilder()
+  // إيمبد رئيسي يضم البنر والعنوان والشرح وفواصل بين اسم القسم وشرحه وبين كل قسم وقسم
+  const mainEmbed = new EmbedBuilder()
     .setColor(0xc9a65c)
     .setTitle(String(config.panelTitle || 'إنشاء تذكرة').slice(0, 256));
 
   if (config.panelDescription) {
-    embed.setDescription(String(config.panelDescription).slice(0, 4096));
+    mainEmbed.setDescription(`${String(config.panelDescription).slice(0, 3900)}\n━━━━━━━━━━━━━━━━━━━━`);
+  } else {
+    mainEmbed.setDescription('━━━━━━━━━━━━━━━━━━━━');
   }
 
   if (config.panelImageUrl && /^https?:\/\//i.test(config.panelImageUrl.trim())) {
-    embed.setImage(config.panelImageUrl.trim());
+    mainEmbed.setImage(config.panelImageUrl.trim());
   }
 
-  const types = Array.isArray(config.ticketTypes) ? config.ticketTypes.slice(0, 25) : [];
-  const rows = [];
+  const buttonRows = [];
   let currentRow = new ActionRowBuilder();
 
   for (let i = 0; i < types.length; i++) {
     const type = normalizeTicketType(types[i]);
-    embed.addFields({
-      name: String(type.sectionTitle || `نوع #${i + 1}`).slice(0, 256),
-      value: `${String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 980)}\n──────────────`,
+    const title = String(type.sectionTitle || `قسم #${i + 1}`).slice(0, 256);
+    const desc = String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 900);
+    const separatorAfter = i < types.length - 1 ? '\n━━━━━━━━━━━━━━━━━━━━' : '';
+
+    // فصل واضح بين اسم القسم (الـ name) وشرحه (الـ value) وفصل بين كل قسم وقسم
+    mainEmbed.addFields({
+      name: title,
+      value: `\n${desc}${separatorAfter}`.slice(0, 1024),
       inline: false
     });
 
-    const button = new ButtonBuilder()
+    const btn = new ButtonBuilder()
       .setCustomId(`open_ticket_type:${type.id}`)
       .setLabel(String(type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80))
       .setStyle(mapButtonStyle(type.buttonStyle));
 
     if (currentRow.components.length >= 5) {
-      if (rows.length < 5) rows.push(currentRow);
+      if (buttonRows.length < 5) buttonRows.push(currentRow);
       currentRow = new ActionRowBuilder();
     }
-    if (rows.length < 5) currentRow.addComponents(button);
+    if (buttonRows.length < 5) currentRow.addComponents(btn);
   }
 
-  if (currentRow.components.length && rows.length < 5) {
-    rows.push(currentRow);
+  if (currentRow.components.length && buttonRows.length < 5) {
+    buttonRows.push(currentRow);
   }
 
   if (config.panelNotes) {
-    embed.addFields({
+    mainEmbed.addFields({
       name: 'ملاحظات مهمة',
-      value: String(config.panelNotes).slice(0, 1024),
+      value: `\n${String(config.panelNotes).slice(0, 1000)}`.slice(0, 1024),
       inline: false
     });
   }
 
-  return { embeds: [embed], components: rows };
-}
-
-async function sendV2Message(channelId, body) {
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  return rest.post(Routes.channelMessages(channelId), { body });
+  return [{ embeds: [mainEmbed], components: buttonRows }];
 }
 
 async function deliverPanelToChannel(channel, normCfg, forceNew = false) {
@@ -500,21 +427,18 @@ async function deliverPanelToChannel(channel, normCfg, forceNew = false) {
     lastPanelMessageIds = [];
   }
 
-  try {
-    const v2Body = buildV2PanelBody(normCfg);
-    const created = await sendV2Message(channel.id, v2Body);
-    lastPanelMessageIds = [created.id];
-    lastPanelSignature = signature;
-    console.log(`V2 Panel sent in #${channel.name} (${channel.id}), msg=${created.id}, types=${normCfg.ticketTypes.length}`);
-    return { ok: true, channel };
-  } catch (v2Err) {
-    console.warn('V2 panel fallback to embed:', v2Err.message);
-    const fallbackPayload = buildFallbackEmbedPanel(normCfg);
-    const sent = await channel.send(fallbackPayload);
-    lastPanelMessageIds = [sent.id];
-    lastPanelSignature = signature;
-    return { ok: true, channel };
+  const payloads = buildEmbedPanelPayloads(normCfg);
+  const sentIds = [];
+
+  for (const payload of payloads) {
+    const sent = await channel.send(payload);
+    sentIds.push(sent.id);
   }
+
+  lastPanelMessageIds = sentIds;
+  lastPanelSignature = signature;
+  console.log(`Embed Panel sent in #${channel.name} (${channel.id}), msg=${sentIds.join(',')}, types=${normCfg.ticketTypes.length}`);
+  return { ok: true, channel };
 }
 
 async function ensurePanelChannel(config, forceNew = false, targetChannelIdOverride = '') {
