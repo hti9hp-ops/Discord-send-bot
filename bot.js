@@ -210,15 +210,19 @@ async function syncTicketSequence(clientDb) {
     SELECT setval(
       'ticket_number_seq',
       GREATEST(
-        123,
+        123::bigint,
         COALESCE(
           (
             SELECT MAX(
-              NULLIF(regexp_replace(COALESCE(ticket_number, ''), '[^0-9]', '', 'g'), '')::bigint
+              CASE
+                WHEN regexp_replace(COALESCE(ticket_number, ''), '[^0-9]', '', 'g') ~ '^[0-9]+$'
+                THEN regexp_replace(COALESCE(ticket_number, ''), '[^0-9]', '', 'g')::bigint
+                ELSE 0::bigint
+              END
             )
             FROM tickets
           ),
-          123
+          0::bigint
         )
       ),
       true
@@ -326,7 +330,7 @@ async function initDatabase() {
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
 
-    await syncTicketSequence(clientDb);
+    await syncTicketSequence(clientDb).catch(e => console.warn('syncTicketSequence:', e.message));
 
     await clientDb.query(`CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status);`).catch(e => console.warn('tickets_status_idx:', e.message));
     await clientDb.query(`CREATE INDEX IF NOT EXISTS ticket_messages_channel_idx ON ticket_messages(channel_id, created_at);`).catch(e => console.warn('ticket_messages_channel_idx:', e.message));
@@ -1848,10 +1852,10 @@ client.on('interactionCreate', async interaction => {
           }
         }
 
-        await syncTicketSequence(dbClient);
+        await syncTicketSequence(dbClient).catch(() => {});
 
         let inserted = false;
-        for (let attempt = 0; attempt < 10; attempt++) {
+        for (let attempt = 0; attempt < 20; attempt++) {
           const numberResult = await dbClient.query(
             "SELECT nextval('ticket_number_seq') AS n"
           );
