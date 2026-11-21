@@ -52,7 +52,7 @@ const client = new Client({
 
 let cachedConfig = null;
 let lastPanelSignature = '';
-let lastPanelMessageId = '';
+let lastPanelMessageIds = [];
 const actionLocks = new Set();
 
 function sanitizeSnowflake(val) {
@@ -128,6 +128,15 @@ async function runWithLock(lockKey, fn) {
   } finally {
     actionLocks.delete(lockKey);
   }
+}
+
+function mapButtonStyleNumber(styleName) {
+  return ({
+    Primary: 1,
+    Secondary: 2,
+    Success: 3,
+    Danger: 4
+  })[styleName] || 1;
 }
 
 function mapButtonStyle(styleName) {
@@ -342,7 +351,75 @@ async function syncGuildMeta(guild) {
   console.log('Discord channels, categories and roles synced.');
 }
 
-function buildPanelPayload(config) {
+function buildV2PanelBody(config) {
+  const components = [];
+
+  if (config.panelImageUrl && /^https?:\/\//i.test(config.panelImageUrl.trim())) {
+    components.push({
+      type: 12,
+      items: [
+        {
+          media: { url: config.panelImageUrl.trim() }
+        }
+      ]
+    });
+  }
+
+  const titleText = `## ${String(config.panelTitle || 'إنشاء تذكرة').slice(0, 200)}`;
+  const descText = config.panelDescription ? `\n${String(config.panelDescription).slice(0, 1800)}` : '';
+  components.push({
+    type: 10,
+    content: `${titleText}${descText}`.slice(0, 2000)
+  });
+
+  const types = Array.isArray(config.ticketTypes) ? config.ticketTypes.slice(0, 10) : [];
+
+  for (let i = 0; i < types.length; i++) {
+    const type = normalizeTicketType(types[i]);
+
+    const sectionTitle = `### ${String(type.sectionTitle || `قسم #${i + 1}`).slice(0, 200)}`;
+    const sectionDesc = String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 1500);
+
+    components.push({
+      type: 10,
+      content: `${sectionTitle}\n${sectionDesc}`.slice(0, 2000)
+    });
+
+    components.push({
+      type: 1,
+      components: [
+        {
+          type: 2,
+          style: mapButtonStyleNumber(type.buttonStyle),
+          label: String(type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80),
+          custom_id: `open_ticket_type:${type.id}`
+        }
+      ]
+    });
+
+    if (i < types.length - 1 || Boolean(config.panelNotes)) {
+      components.push({
+        type: 14,
+        divider: true,
+        spacing: 1
+      });
+    }
+  }
+
+  if (config.panelNotes) {
+    components.push({
+      type: 10,
+      content: `**ملاحظات مهمة**\n${String(config.panelNotes).slice(0, 1500)}`.slice(0, 2000)
+    });
+  }
+
+  return {
+    flags: 32768,
+    components
+  };
+}
+
+function buildFallbackEmbedPanel(config) {
   const embed = new EmbedBuilder()
     .setColor(0xc9a65c)
     .setTitle(String(config.panelTitle || 'إنشاء تذكرة').slice(0, 256));
@@ -355,23 +432,15 @@ function buildPanelPayload(config) {
     embed.setImage(config.panelImageUrl.trim());
   }
 
-  if (config.panelNotes) {
-    embed.addFields({
-      name: 'ملاحظات مهمة',
-      value: String(config.panelNotes).slice(0, 1024)
-    });
-  }
-
   const types = Array.isArray(config.ticketTypes) ? config.ticketTypes.slice(0, 25) : [];
   const rows = [];
   let currentRow = new ActionRowBuilder();
 
   for (let i = 0; i < types.length; i++) {
     const type = normalizeTicketType(types[i]);
-
     embed.addFields({
       name: String(type.sectionTitle || `نوع #${i + 1}`).slice(0, 256),
-      value: String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 1024),
+      value: `${String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 980)}\n──────────────`,
       inline: false
     });
 
@@ -384,7 +453,6 @@ function buildPanelPayload(config) {
       if (rows.length < 5) rows.push(currentRow);
       currentRow = new ActionRowBuilder();
     }
-
     if (rows.length < 5) currentRow.addComponents(button);
   }
 
@@ -392,12 +460,68 @@ function buildPanelPayload(config) {
     rows.push(currentRow);
   }
 
+  if (config.panelNotes) {
+    embed.addFields({
+      name: 'ملاحظات مهمة',
+      value: String(config.panelNotes).slice(0, 1024),
+      inline: false
+    });
+  }
+
   return { embeds: [embed], components: rows };
 }
 
-async function ensurePanelChannel(config, forceNew = false) {
+async function sendV2Message(channelId, body) {
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  return rest.post(Routes.channelMessages(channelId), { body });
+}
+
+async function deliverPanelToChannel(channel, normCfg, forceNew = false) {
+  const signature = JSON.stringify({
+    ch: channel.id,
+    img: normCfg.panelImageUrl,
+    title: normCfg.panelTitle,
+    desc: normCfg.panelDescription,
+    notes: normCfg.panelNotes,
+    types: normCfg.ticketTypes
+  });
+
+  if (!forceNew && signature === lastPanelSignature && lastPanelMessageIds.length > 0) {
+    return { ok: true, channel };
+  }
+
+  if (lastPanelMessageIds.length > 0) {
+    for (const oldId of lastPanelMessageIds) {
+      const oldMsg = await channel.messages.fetch(oldId).catch(() => null);
+      if (oldMsg) {
+        await oldMsg.delete().catch(() => {});
+      }
+    }
+    lastPanelMessageIds = [];
+  }
+
+  try {
+    const v2Body = buildV2PanelBody(normCfg);
+    const created = await sendV2Message(channel.id, v2Body);
+    lastPanelMessageIds = [created.id];
+    lastPanelSignature = signature;
+    console.log(`V2 Panel sent in #${channel.name} (${channel.id}), msg=${created.id}, types=${normCfg.ticketTypes.length}`);
+    return { ok: true, channel };
+  } catch (v2Err) {
+    console.warn('V2 panel fallback to embed:', v2Err.message);
+    const fallbackPayload = buildFallbackEmbedPanel(normCfg);
+    const sent = await channel.send(fallbackPayload);
+    lastPanelMessageIds = [sent.id];
+    lastPanelSignature = signature;
+    return { ok: true, channel };
+  }
+}
+
+async function ensurePanelChannel(config, forceNew = false, targetChannelIdOverride = '') {
   const normCfg = normalizeConfig(config || {});
-  if (!normCfg.panelChannelId) {
+  const targetChannelId = sanitizeSnowflake(targetChannelIdOverride) || normCfg.panelChannelId;
+
+  if (!targetChannelId) {
     console.warn('Panel skipped: panelChannelId is empty in config.');
     return { ok: false, reason: 'لم يتم تحديد روم اللوحة في الإعدادات وحفظه.' };
   }
@@ -408,44 +532,83 @@ async function ensurePanelChannel(config, forceNew = false) {
     return { ok: false, reason: 'تعذر الوصول إلى السيرفر.' };
   }
 
-  const channel = await guild.channels.fetch(normCfg.panelChannelId).catch(() => null);
+  const channel = await guild.channels.fetch(targetChannelId).catch(() => null);
   if (!channel || channel.type !== ChannelType.GuildText) {
-    console.warn(`Panel skipped: channel ${normCfg.panelChannelId} not found or not text channel.`);
+    console.warn(`Panel skipped: channel ${targetChannelId} not found or not text channel.`);
     return { ok: false, reason: 'روم اللوحة غير موجود أو ليس روماً نصياً.' };
   }
 
-  const signature = JSON.stringify({
-    ch: normCfg.panelChannelId,
-    img: normCfg.panelImageUrl,
-    title: normCfg.panelTitle,
-    desc: normCfg.panelDescription,
-    notes: normCfg.panelNotes,
-    types: normCfg.ticketTypes
-  });
+  return deliverPanelToChannel(channel, normCfg, forceNew);
+}
 
-  if (!forceNew && signature === lastPanelSignature && lastPanelMessageId) {
-    return { ok: true, channel };
+async function buildStatsEmbed(guildId) {
+  const [summaryRes, typesRes] = await Promise.all([
+    pool.query(
+      `SELECT
+         COUNT(*)::int AS total_tickets,
+         COUNT(*) FILTER (WHERE status = 'open')::int AS open_tickets,
+         COUNT(*) FILTER (WHERE status = 'closed')::int AS closed_tickets,
+         COUNT(*) FILTER (WHERE claimed_by_id IS NOT NULL)::int AS claimed_tickets,
+         COUNT(*) FILTER (WHERE escalated_to_owner = TRUE)::int AS escalated_tickets
+       FROM tickets
+       WHERE guild_id = $1`,
+      [guildId]
+    ),
+    pool.query(
+      `SELECT
+         COALESCE(type_config->>'sectionTitle', 'غير محدد') AS type_name,
+         COUNT(*)::int AS cnt
+       FROM tickets
+       WHERE guild_id = $1
+       GROUP BY COALESCE(type_config->>'sectionTitle', 'غير محدد')
+       ORDER BY cnt DESC
+       LIMIT 10`,
+      [guildId]
+    )
+  ]);
+
+  const s = summaryRes.rows[0] || {
+    total_tickets: 0,
+    open_tickets: 0,
+    closed_tickets: 0,
+    claimed_tickets: 0,
+    escalated_tickets: 0
+  };
+
+  const breakdownText = typesRes.rows.length
+    ? typesRes.rows.map((r, i) => `**${i + 1}. ${r.type_name}:** ${r.cnt}`).join('\n')
+    : 'لا توجد تذاكر مسجلة بعد.';
+
+  return new EmbedBuilder()
+    .setColor(0xc9a65c)
+    .setTitle('📊 إحصائيات نظام الشكاوى | GAME HUB')
+    .addFields(
+      { name: 'إجمالي الشكاوى', value: String(s.total_tickets), inline: true },
+      { name: 'الشكاوى المفتوحة', value: String(s.open_tickets), inline: true },
+      { name: 'الشكاوى المغلقة', value: String(s.closed_tickets), inline: true },
+      { name: 'الشكاوى المستلمة', value: String(s.claimed_tickets), inline: true },
+      { name: 'المحولة إلى أونر', value: String(s.escalated_tickets), inline: true },
+      { name: 'توزيع الأنواع', value: breakdownText.slice(0, 1024), inline: false }
+    )
+    .setTimestamp();
+}
+
+async function sendStatsToChannel(guild, config, channelOption) {
+  const cfg = normalizeConfig(config || {});
+  const targetChannel =
+    (channelOption && channelOption.type === ChannelType.GuildText ? channelOption : null) ||
+    (cfg.statsChannelId ? await guild.channels.fetch(cfg.statsChannelId).catch(() => null) : null);
+
+  if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
+    return {
+      ok: false,
+      reason: 'لم يتم تحديد شات الإحصائيات في لوحة التحكم أو لم يتم اختيار روم في الأمر.'
+    };
   }
 
-  const payload = buildPanelPayload(normCfg);
-
-  if (!forceNew && lastPanelMessageId) {
-    const oldMessage = await channel.messages.fetch(lastPanelMessageId).catch(() => null);
-
-    if (oldMessage) {
-      await oldMessage.edit(payload);
-      lastPanelSignature = signature;
-      console.log(`Panel updated in #${channel.name} (${channel.id})`);
-      return { ok: true, channel };
-    }
-  }
-
-  const sent = await channel.send(payload);
-  lastPanelMessageId = sent.id;
-  lastPanelSignature = signature;
-  console.log(`Panel sent in #${channel.name} (${channel.id}), msg=${sent.id}, types=${normCfg.ticketTypes.length}`);
-
-  return { ok: true, channel };
+  const statsEmbed = await buildStatsEmbed(guild.id);
+  await targetChannel.send({ embeds: [statsEmbed] });
+  return { ok: true, channel: targetChannel };
 }
 
 async function registerCommands() {
@@ -453,6 +616,30 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('send-panel')
       .setDescription('إرسال أو تحديث لوحة أنواع الشكاوى في الروم المحدد')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('send-ticket-panel')
+      .setDescription('إرسال بانل الشكوى إلى روم الشكاوى المحدد')
+      .addChannelOption(opt =>
+        opt
+          .setName('channel')
+          .setDescription('روم اختياري لإرسال البانل إليه بدلاً من الروم الافتراضي')
+          .addChannelTypes(ChannelType.GuildText)
+          .setRequired(false)
+      )
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .toJSON(),
+    new SlashCommandBuilder()
+      .setName('send-stats')
+      .setDescription('إرسال إحصائيات الشكاوى في الشات المحدد')
+      .addChannelOption(opt =>
+        opt
+          .setName('channel')
+          .setDescription('شات اختياري لإرسال الإحصائيات إليه')
+          .addChannelTypes(ChannelType.GuildText)
+          .setRequired(false)
+      )
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
       .toJSON()
   ];
@@ -1105,8 +1292,7 @@ client.on('interactionCreate', async interaction => {
 
     const cfg = cachedConfig || {};
 
-    if (interaction.isChatInputCommand() &&
-        interaction.commandName === 'send-panel') {
+    if (interaction.isChatInputCommand()) {
       if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
         return interaction.reply({
           content: 'هذا الأمر مخصص للأدمن فقط.',
@@ -1114,18 +1300,52 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      const panelRes = await ensurePanelChannel(cfg, true);
-      if (!panelRes?.ok) {
+      if (interaction.commandName === 'send-panel') {
+        const panelRes = await ensurePanelChannel(cfg, true);
+        if (!panelRes?.ok) {
+          return interaction.reply({
+            content: `تعذر إرسال اللوحة: ${panelRes?.reason || 'تحقق من إعدادات روم اللوحة وحفظها من لوحة التحكم.'}`,
+            ephemeral: true
+          });
+        }
+
         return interaction.reply({
-          content: `تعذر إرسال اللوحة: ${panelRes?.reason || 'تحقق من إعدادات روم اللوحة وحفظها من لوحة التحكم.'}`,
+          content: `تم إرسال لوحة الشكاوى بنجاح في ${panelRes.channel}.`,
           ephemeral: true
         });
       }
 
-      return interaction.reply({
-        content: `تم إرسال لوحة الشكاوى بنجاح في ${panelRes.channel}.`,
-        ephemeral: true
-      });
+      if (interaction.commandName === 'send-ticket-panel') {
+        const chosenChannel = interaction.options.getChannel('channel');
+        const panelRes = await ensurePanelChannel(cfg, true, chosenChannel?.id || '');
+        if (!panelRes?.ok) {
+          return interaction.reply({
+            content: `تعذر إرسال بانل الشكوى: ${panelRes?.reason || 'تحقق من إعدادات روم الشكاوى في لوحة التحكم.'}`,
+            ephemeral: true
+          });
+        }
+
+        return interaction.reply({
+          content: `تم إرسال بانل الشكوى إلى ${panelRes.channel}.`,
+          ephemeral: true
+        });
+      }
+
+      if (interaction.commandName === 'send-stats') {
+        const chosenChannel = interaction.options.getChannel('channel');
+        const statsRes = await sendStatsToChannel(interaction.guild, cfg, chosenChannel);
+        if (!statsRes?.ok) {
+          return interaction.reply({
+            content: `تعذر إرسال الإحصائيات: ${statsRes?.reason || 'تحقق من إعدادات شات الإحصائيات.'}`,
+            ephemeral: true
+          });
+        }
+
+        return interaction.reply({
+          content: `تم إرسال الإحصائيات بنجاح في ${statsRes.channel}.`,
+          ephemeral: true
+        });
+      }
     }
 
     if (interaction.isButton()) {
