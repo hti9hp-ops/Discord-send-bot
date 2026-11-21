@@ -352,10 +352,10 @@ async function syncGuildMeta(guild) {
 }
 
 function buildV2PanelBody(config) {
-  const components = [];
+  const innerComponents = [];
 
   if (config.panelImageUrl && /^https?:\/\//i.test(config.panelImageUrl.trim())) {
-    components.push({
+    innerComponents.push({
       type: 12,
       items: [
         {
@@ -367,7 +367,7 @@ function buildV2PanelBody(config) {
 
   const titleText = `## ${String(config.panelTitle || 'إنشاء تذكرة').slice(0, 200)}`;
   const descText = config.panelDescription ? `\n${String(config.panelDescription).slice(0, 1800)}` : '';
-  components.push({
+  innerComponents.push({
     type: 10,
     content: `${titleText}${descText}`.slice(0, 2000)
   });
@@ -380,12 +380,12 @@ function buildV2PanelBody(config) {
     const sectionTitle = `### ${String(type.sectionTitle || `قسم #${i + 1}`).slice(0, 200)}`;
     const sectionDesc = String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 1500);
 
-    components.push({
+    innerComponents.push({
       type: 10,
       content: `${sectionTitle}\n\n${sectionDesc}`.slice(0, 2000)
     });
 
-    components.push({
+    innerComponents.push({
       type: 1,
       components: [
         {
@@ -398,7 +398,7 @@ function buildV2PanelBody(config) {
     });
 
     if (i < types.length - 1 || Boolean(config.panelNotes)) {
-      components.push({
+      innerComponents.push({
         type: 14,
         divider: true,
         spacing: 1
@@ -407,7 +407,7 @@ function buildV2PanelBody(config) {
   }
 
   if (config.panelNotes) {
-    components.push({
+    innerComponents.push({
       type: 10,
       content: `**ملاحظات مهمة**\n\n${String(config.panelNotes).slice(0, 1500)}`.slice(0, 2000)
     });
@@ -415,7 +415,12 @@ function buildV2PanelBody(config) {
 
   return {
     flags: 32768,
-    components
+    components: [
+      {
+        type: 17,
+        components: innerComponents
+      }
+    ]
   };
 }
 
