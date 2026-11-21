@@ -326,6 +326,7 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS ticket_staff_actions (
         id BIGSERIAL PRIMARY KEY,
         channel_id TEXT,
+        ticket_channel_id TEXT,
         actor_id TEXT NOT NULL DEFAULT 'SYSTEM',
         actor_tag TEXT NOT NULL DEFAULT '',
         action TEXT NOT NULL DEFAULT '',
@@ -333,10 +334,20 @@ async function initDatabase() {
       );
 
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS channel_id TEXT;
+      ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS ticket_channel_id TEXT;
+      ALTER TABLE ticket_staff_actions ALTER COLUMN ticket_channel_id DROP NOT NULL;
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS actor_id TEXT NOT NULL DEFAULT 'SYSTEM';
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS actor_tag TEXT NOT NULL DEFAULT '';
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT '';
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+      UPDATE ticket_staff_actions
+      SET ticket_channel_id = COALESCE(ticket_channel_id, channel_id, '')
+      WHERE ticket_channel_id IS NULL;
+
+      UPDATE ticket_staff_actions
+      SET channel_id = COALESCE(channel_id, ticket_channel_id, '')
+      WHERE channel_id IS NULL;
     `);
 
     await clientDb.query(`CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status);`).catch(e => console.warn('tickets_status_idx:', e.message));
@@ -722,8 +733,8 @@ async function getTicket(channelId) {
 
 async function addStaffAction(channelId, action, user) {
   await pool.query(
-    `INSERT INTO ticket_staff_actions(channel_id,actor_id,actor_tag,action)
-     VALUES($1,$2,$3,$4)`,
+    `INSERT INTO ticket_staff_actions(channel_id,ticket_channel_id,actor_id,actor_tag,action)
+     VALUES($1,$1,$2,$3,$4)`,
     [channelId, user?.id || 'SYSTEM', user?.tag || 'النظام', action]
   );
 }
@@ -808,7 +819,7 @@ async function fetchTicketArchive(channelId) {
       [channelId]
     ),
     pool.query(
-      'SELECT * FROM ticket_staff_actions WHERE channel_id=$1 ORDER BY created_at ASC',
+      'SELECT * FROM ticket_staff_actions WHERE COALESCE(channel_id, ticket_channel_id)=$1 ORDER BY created_at ASC',
       [channelId]
     )
   ]);
@@ -1827,8 +1838,8 @@ client.on('interactionCreate', async interaction => {
         );
 
         await pool.query(
-          `INSERT INTO ticket_staff_actions(channel_id,actor_id,actor_tag,action)
-           VALUES($1,$2,$3,$4)`,
+          `INSERT INTO ticket_staff_actions(channel_id,ticket_channel_id,actor_id,actor_tag,action)
+           VALUES($1,$1,$2,$3,$4)`,
           [
             channel.id,
             interaction.user.id,
