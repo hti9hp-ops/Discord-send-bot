@@ -199,7 +199,6 @@ function serializeMessage(msg) {
 async function initDatabase() {
   const clientDb = await pool.connect();
   try {
-    await clientDb.query('BEGIN');
     await clientDb.query(`
       CREATE SEQUENCE IF NOT EXISTS ticket_number_seq START WITH 124;
 
@@ -230,27 +229,32 @@ async function initDatabase() {
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_by_id TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_by_tag TEXT;
 
-      CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status);
-
       CREATE TABLE IF NOT EXISTS ticket_messages (
         message_id TEXT PRIMARY KEY,
-        channel_id TEXT NOT NULL REFERENCES tickets(channel_id) ON DELETE CASCADE,
+        channel_id TEXT,
         author_tag TEXT NOT NULL,
         author_id TEXT NOT NULL,
         is_bot BOOLEAN NOT NULL DEFAULT FALSE,
         content TEXT NOT NULL DEFAULT '',
-        created_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         deleted_at TIMESTAMPTZ,
         attachments JSONB NOT NULL DEFAULT '[]'::jsonb,
         links JSONB NOT NULL DEFAULT '[]'::jsonb
       );
 
-      CREATE INDEX IF NOT EXISTS ticket_messages_channel_idx
-        ON ticket_messages(channel_id, created_at);
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS channel_id TEXT;
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS author_tag TEXT NOT NULL DEFAULT '';
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS author_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS content TEXT NOT NULL DEFAULT '';
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS attachments JSONB NOT NULL DEFAULT '[]'::jsonb;
+      ALTER TABLE ticket_messages ADD COLUMN IF NOT EXISTS links JSONB NOT NULL DEFAULT '[]'::jsonb;
 
       CREATE TABLE IF NOT EXISTS ticket_message_edits (
         id BIGSERIAL PRIMARY KEY,
-        message_id TEXT NOT NULL REFERENCES ticket_messages(message_id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL,
         edited_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         old_content TEXT NOT NULL DEFAULT '',
         new_content TEXT NOT NULL DEFAULT ''
@@ -258,18 +262,26 @@ async function initDatabase() {
 
       CREATE TABLE IF NOT EXISTS ticket_staff_actions (
         id BIGSERIAL PRIMARY KEY,
-        channel_id TEXT NOT NULL REFERENCES tickets(channel_id) ON DELETE CASCADE,
-        actor_id TEXT NOT NULL,
-        actor_tag TEXT NOT NULL,
-        action TEXT NOT NULL,
+        channel_id TEXT,
+        actor_id TEXT NOT NULL DEFAULT 'SYSTEM',
+        actor_tag TEXT NOT NULL DEFAULT '',
+        action TEXT NOT NULL DEFAULT '',
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+
+      ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS channel_id TEXT;
+      ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS actor_id TEXT NOT NULL DEFAULT 'SYSTEM';
+      ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS actor_tag TEXT NOT NULL DEFAULT '';
+      ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT '';
+      ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
-    await clientDb.query('COMMIT');
+
+    await clientDb.query(`CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status);`).catch(e => console.warn('tickets_status_idx:', e.message));
+    await clientDb.query(`CREATE INDEX IF NOT EXISTS ticket_messages_channel_idx ON ticket_messages(channel_id, created_at);`).catch(e => console.warn('ticket_messages_channel_idx:', e.message));
+
     console.log('PostgreSQL schema ready.');
   } catch (err) {
-    await clientDb.query('ROLLBACK').catch(() => {});
-    console.error('initDatabase warning/error:', err.message);
+    console.error('initDatabase error:', err.message);
   } finally {
     clientDb.release();
   }
@@ -854,7 +866,11 @@ async function sendArchiveToLogChannel(guild, channelId, modeLabel) {
   return data.ticketNumber;
 }
 
-client.once('ready', async () => {
+let readyHandled = false;
+async function handleClientReady() {
+  if (readyHandled) return;
+  readyHandled = true;
+
   console.log(`Bot ready: ${client.user.tag}`);
 
   await initDatabase();
@@ -906,7 +922,10 @@ client.once('ready', async () => {
       isSyncRunning = false;
     }
   }, 60000);
-});
+}
+
+client.once('clientReady', handleClientReady);
+client.once('ready', handleClientReady);
 
 client.on('guildMemberAdd', async member => {
   try {
