@@ -216,6 +216,7 @@ async function initDatabase() {
         guild_id TEXT NOT NULL,
         ticket_number TEXT NOT NULL UNIQUE,
         user_id TEXT,
+        user_tag TEXT,
         opener_id TEXT NOT NULL,
         opener_tag TEXT NOT NULL,
         type_config JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -236,6 +237,8 @@ async function initDatabase() {
 
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS user_id TEXT;
       ALTER TABLE tickets ALTER COLUMN user_id DROP NOT NULL;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS user_tag TEXT;
+      ALTER TABLE tickets ALTER COLUMN user_tag DROP NOT NULL;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS guild_id TEXT NOT NULL DEFAULT '';
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ticket_number TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS opener_id TEXT NOT NULL DEFAULT '';
@@ -1836,14 +1839,15 @@ client.on('interactionCreate', async interaction => {
 
         await dbClient.query(
           `INSERT INTO tickets(
-            channel_id,guild_id,ticket_number,user_id,opener_id,opener_tag,type_config,answers
+            channel_id,guild_id,ticket_number,user_id,user_tag,opener_id,opener_tag,type_config,answers
           )
-          VALUES($1,$2,$3,$4,$5,$6,$7::jsonb,$8::jsonb)`,
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb)`,
           [
             channel.id,
             interaction.guild.id,
             ticketNumber,
             interaction.user.id,
+            interaction.user.tag,
             interaction.user.id,
             interaction.user.tag,
             JSON.stringify(type),
