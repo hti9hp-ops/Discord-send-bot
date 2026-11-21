@@ -205,6 +205,27 @@ function serializeMessage(msg) {
   };
 }
 
+async function syncTicketSequence(clientDb) {
+  await clientDb.query(`
+    SELECT setval(
+      'ticket_number_seq',
+      GREATEST(
+        123,
+        COALESCE(
+          (
+            SELECT MAX(
+              NULLIF(regexp_replace(COALESCE(ticket_number, ''), '[^0-9]', '', 'g'), '')::bigint
+            )
+            FROM tickets
+          ),
+          123
+        )
+      ),
+      true
+    );
+  `);
+}
+
 async function initDatabase() {
   const clientDb = await pool.connect();
   try {
@@ -304,6 +325,8 @@ async function initDatabase() {
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT '';
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
+
+    await syncTicketSequence(clientDb);
 
     await clientDb.query(`CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status);`).catch(e => console.warn('tickets_status_idx:', e.message));
     await clientDb.query(`CREATE INDEX IF NOT EXISTS ticket_messages_channel_idx ON ticket_messages(channel_id, created_at);`).catch(e => console.warn('ticket_messages_channel_idx:', e.message));
@@ -1825,10 +1848,28 @@ client.on('interactionCreate', async interaction => {
           }
         }
 
-        const numberResult = await dbClient.query(
-          "SELECT nextval('ticket_number_seq') AS n"
-        );
-        ticketNumber = String(numberResult.rows[0].n).padStart(6, '0');
+        await syncTicketSequence(dbClient);
+
+        let inserted = false;
+        for (let attempt = 0; attempt < 10; attempt++) {
+          const numberResult = await dbClient.query(
+            "SELECT nextval('ticket_number_seq') AS n"
+          );
+          const candidateNumber = String(numberResult.rows[0].n).padStart(6, '0');
+          const existsNum = await dbClient.query(
+            'SELECT 1 FROM tickets WHERE ticket_number=$1 LIMIT 1',
+            [candidateNumber]
+          );
+          if (!existsNum.rowCount) {
+            ticketNumber = candidateNumber;
+            inserted = true;
+            break;
+          }
+        }
+
+        if (!inserted || !ticketNumber) {
+          throw new Error('تعذر توليد رقم شكوى فريد جديد.');
+        }
 
         channel = await interaction.guild.channels.create({
           name: `ticket-${ticketNumber}`,
