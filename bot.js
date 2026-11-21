@@ -182,6 +182,27 @@ function formatDateTime(value) {
   });
 }
 
+function formatDuration(startVal, endVal) {
+  if (!startVal || !endVal) return '—';
+  const startMs = new Date(startVal).getTime();
+  const endMs = new Date(endVal).getTime();
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) return '—';
+
+  const diffSec = Math.max(0, Math.floor((endMs - startMs) / 1000));
+  const days = Math.floor(diffSec / 86400);
+  const hours = Math.floor((diffSec % 86400) / 3600);
+  const mins = Math.floor((diffSec % 3600) / 60);
+  const secs = diffSec % 60;
+
+  const parts = [];
+  if (days > 0) parts.push(`${days}ي`);
+  if (hours > 0) parts.push(`${hours}س`);
+  if (mins > 0) parts.push(`${mins}د`);
+  if (secs > 0 || parts.length === 0) parts.push(`${secs}ث`);
+
+  return parts.join(' ');
+}
+
 function formatText(template, member, guild) {
   return (template || '')
     .replace(/\{user\}/g, member ? `<@${member.id}>` : '')
@@ -257,12 +278,16 @@ async function initDatabase() {
         answers JSONB NOT NULL DEFAULT '{}'::jsonb,
         status TEXT NOT NULL DEFAULT 'open',
         opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        claimed_at TIMESTAMPTZ,
         closed_at TIMESTAMPTZ,
         closed_by_id TEXT,
         closed_by_tag TEXT,
         close_reason TEXT,
         claimed_by_id TEXT,
         claimed_by_tag TEXT,
+        staff_rating INTEGER,
+        rated_by_id TEXT,
+        rated_at TIMESTAMPTZ,
         escalated_to_owner BOOLEAN NOT NULL DEFAULT FALSE,
         escalated_at TIMESTAMPTZ,
         escalated_by_id TEXT,
@@ -281,12 +306,16 @@ async function initDatabase() {
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS answers JSONB NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMPTZ;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_by_id TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_by_tag TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS close_reason TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS claimed_by_id TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS claimed_by_tag TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS staff_rating INTEGER;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS rated_by_id TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS rated_at TIMESTAMPTZ;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_to_owner BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_at TIMESTAMPTZ;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_by_id TEXT;
@@ -795,6 +824,32 @@ function buildTicketActionRow(ticketType) {
   return new ActionRowBuilder().addComponents(...buttons);
 }
 
+function buildRatingRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('rate_staff:1').setLabel('⭐ 1').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rate_staff:2').setLabel('⭐⭐ 2').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rate_staff:3').setLabel('⭐⭐⭐ 3').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rate_staff:4').setLabel('⭐⭐⭐⭐ 4').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('rate_staff:5').setLabel('⭐⭐⭐⭐⭐ 5').setStyle(ButtonStyle.Success)
+  );
+}
+
+async function lockTicketChatForBothParties(channel, ticket) {
+  if (!channel || !ticket) return;
+
+  const participantIds = [...new Set([
+    sanitizeSnowflake(ticket.opener_id),
+    sanitizeSnowflake(ticket.claimed_by_id),
+    ...(Array.isArray(ticket.type_config?.staffRoleIds) ? ticket.type_config.staffRoleIds : [])
+  ].filter(Boolean))];
+
+  for (const targetId of participantIds) {
+    await channel.permissionOverwrites.edit(targetId, {
+      SendMessages: false
+    }).catch(err => console.warn(`Lock overwrite failed for ${targetId}:`, err.message));
+  }
+}
+
 async function fetchTicketArchive(channelId) {
   const ticketResult = await pool.query(
     'SELECT * FROM tickets WHERE channel_id=$1',
@@ -856,13 +911,19 @@ async function fetchTicketArchive(channelId) {
     typeConfig: ticket.type_config || {},
     answers: ticket.answers || {},
     openedAt: ticket.opened_at,
+    claimedAt: ticket.claimed_at,
     closedAt: ticket.closed_at,
+    closedById: ticket.closed_by_id,
+    closedByTag: ticket.closed_by_tag,
     closedBy: ticket.closed_by_tag
       ? `${ticket.closed_by_tag} (${ticket.closed_by_id})`
       : null,
+    claimedById: ticket.claimed_by_id,
+    claimedByTag: ticket.claimed_by_tag,
     claimedBy: ticket.claimed_by_tag
       ? `${ticket.claimed_by_tag} (${ticket.claimed_by_id})`
       : null,
+    staffRating: ticket.staff_rating,
     escalatedToOwner: Boolean(ticket.escalated_to_owner),
     escalatedBy: ticket.escalated_by_tag
       ? `${ticket.escalated_by_tag} (${ticket.escalated_by_id})`
@@ -967,6 +1028,7 @@ function generateArchiveHtml(data) {
   <div><b>صاحب الشكوى:</b> ${escapeHtml(data.openerTag)} (${escapeHtml(data.openerId)})</div>
   <div><b>روم الشكوى:</b> ${escapeHtml(data.channelId)}</div>
   <div><b>الإداري المستلم:</b> ${escapeHtml(data.claimedBy || 'لم يُستلم')}</div>
+  <div><b>تقييم الإدارة:</b> ${data.staffRating ? `${'⭐'.repeat(data.staffRating)} (${data.staffRating}/5)` : 'لم يُقيّم بعد'}</div>
   <div><b>تحويل إلى أونر:</b> ${data.escalatedToOwner ? `نعم (${escapeHtml(data.escalatedBy || '')})` : 'لا'}</div>
   <div><b>تاريخ الفتح:</b> ${escapeHtml(formatDateTime(data.openedAt))}</div>
   <div><b>تاريخ الإغلاق:</b> ${escapeHtml(formatDateTime(data.closedAt))}</div>
@@ -991,6 +1053,7 @@ function generateArchiveText(data) {
     `تاريخ الفتح: ${formatDateTime(data.openedAt)}`,
     `تاريخ الإغلاق: ${formatDateTime(data.closedAt)}`,
     `الإداري المستلم: ${data.claimedBy || 'لم يستلم'}`,
+    `تقييم الإدارة: ${data.staffRating ? `${data.staffRating}/5` : 'لم يُقيّم بعد'}`,
     `تحويل إلى أونر: ${data.escalatedToOwner ? `نعم (${data.escalatedBy || ''})` : 'لا'}`,
     `من أغلقها: ${data.closedBy || '—'}`,
     `سبب الإغلاق: ${data.closeReason || '—'}`,
@@ -1057,17 +1120,56 @@ async function makePdf(html) {
   }
 }
 
+function buildDetailedLogEmbed(data, modeLabel) {
+  const answersText = Object.entries(data.answers || {})
+    .map(([label, val]) => `${label} : ${val || '—'}`)
+    .join('\n') || 'لا توجد تفاصيل';
+
+  const openToClose = formatDuration(data.openedAt, data.closedAt || new Date());
+  const claimToClose = data.claimedAt
+    ? formatDuration(data.claimedAt, data.closedAt || new Date())
+    : '—';
+
+  const ratingText = data.staffRating
+    ? `${'⭐'.repeat(data.staffRating)} (${data.staffRating}/5)`
+    : 'لم يُقيّم بعد';
+
+  const description = [
+    `**صاحب الشكوى**\n<@${data.openerId}> (${escapeHtml(data.openerTag)})`,
+    `**نوع الشكوى**\n${data.typeConfig.sectionTitle || 'غير محدد'}`,
+    `**تاريخ الشكوى**\n${formatDateTime(data.openedAt)}`,
+    `**مستلم الشكوى**\n${data.claimedById ? `<@${data.claimedById}>` : 'لم يُستلم'}`,
+    `**وقت الاستلام**\n${data.claimedAt ? formatDateTime(data.claimedAt) : '—'}`,
+    `**اللي غلق الشكوى**\n${data.closedById ? `<@${data.closedById}>` : '—'}`,
+    `**وقت الإغلاق**\n${data.closedAt ? formatDateTime(data.closedAt) : '—'}`,
+    `**مدة المعالجة (فتح ← إغلاق)**\n${openToClose}`,
+    `**مدة المعالجة (استلام ← إغلاق)**\n${claimToClose}`,
+    `**تقييم الإدارة**\n${ratingText}`,
+    `**نوع السجل**\n${modeLabel}`,
+    `**إعادة الفتح**\nعدد المرات: 0`,
+    data.closeReason ? `**سبب الإغلاق**\n${data.closeReason}` : '',
+    `**وصف الشكوى**\n${answersText}`
+  ].filter(Boolean).join('\n\n').slice(0, 4096);
+
+  return new EmbedBuilder()
+    .setColor(0xd9383a)
+    .setTitle(`سجل الشكوى #${data.ticketNumber}`)
+    .setDescription(description)
+    .setFooter({ text: `${data.closedByTag || data.openerTag} • ${formatDateTime(data.closedAt || new Date())}` })
+    .setTimestamp();
+}
+
 async function sendArchiveToLogChannel(guild, channelId, modeLabel) {
   const cfg = cachedConfig || {};
 
   if (!cfg.logChannelId) {
-    throw new Error('لم يتم تحديد روم السجلات من لوحة التحكم.');
+    throw new Error('لم يتم تحديد روم اللوق من لوحة التحكم.');
   }
 
   const logChannel = await guild.channels.fetch(cfg.logChannelId).catch(() => null);
 
   if (!logChannel || logChannel.type !== ChannelType.GuildText) {
-    throw new Error('روم السجلات المحدد غير موجود أو ليس روم نصياً.');
+    throw new Error('روم اللوق المحدد غير موجود أو ليس روم نصياً.');
   }
 
   const data = await fetchTicketArchive(channelId);
@@ -1076,49 +1178,29 @@ async function sendArchiveToLogChannel(guild, channelId, modeLabel) {
 
   const files = [
     new AttachmentBuilder(Buffer.from(html, 'utf8'), {
-      name: `Ticket-${data.ticketNumber}.html`
+      name: `ticket-${data.ticketNumber}.html`
     }),
     new AttachmentBuilder(Buffer.from(txt, 'utf8'), {
-      name: `Ticket-${data.ticketNumber}.txt`
+      name: `ticket-${data.ticketNumber}.txt`
     })
   ];
-
-  let pdfNote = 'PDF مرفق';
 
   try {
     const pdf = await makePdf(html);
     files.push(new AttachmentBuilder(pdf, {
-      name: `Ticket-${data.ticketNumber}.pdf`
+      name: `ticket-${data.ticketNumber}.pdf`
     }));
   } catch (error) {
     console.error('PDF generation failed:', error);
-    pdfNote = 'تعذر إنشاء PDF؛ أُرسل HTML وTXT';
   }
 
-  const embed = new EmbedBuilder()
-    .setColor(modeLabel === 'إغلاق' ? 0xef4444 : 0xc9a65c)
-    .setTitle(`GAME HUB ARCHIVES | Ticket-${data.ticketNumber} (${modeLabel})`)
-    .addFields(
-      {
-        name: 'النوع',
-        value: String(data.typeConfig.sectionTitle || 'غير محدد').slice(0, 1024),
-        inline: true
-      },
-      {
-        name: 'صاحب الشكوى',
-        value: `<@${data.openerId}> (\`${data.openerId}\`)`,
-        inline: true
-      },
-      {
-        name: 'الإداري المستلم',
-        value: String(data.claimedBy || 'لم يُستلم').slice(0, 1024),
-        inline: true
-      },
-      { name: 'حالة الأرشيف', value: pdfNote, inline: false }
-    )
-    .setTimestamp();
+  const embed = buildDetailedLogEmbed(data, modeLabel);
 
-  await logChannel.send({ embeds: [embed], files });
+  await logChannel.send({
+    content: `**ملف السجل للشكوى #${data.ticketNumber}:**`,
+    embeds: [embed],
+    files
+  });
 
   return data.ticketNumber;
 }
@@ -1461,6 +1543,46 @@ client.on('interactionCreate', async interaction => {
         return interaction.showModal(modal);
       }
 
+      if (action === 'rate_staff') {
+        const rating = Number(param);
+        const ticket = await getTicket(interaction.channel.id);
+
+        if (!ticket) {
+          return interaction.reply(ephemeralReply({
+            content: 'تعذر العثور على بيانات هذه الشكوى.'
+          }));
+        }
+
+        if (interaction.user.id !== ticket.opener_id) {
+          return interaction.reply(ephemeralReply({
+            content: 'تقييم الإداري متاح لصاحب الشكوى فقط.'
+          }));
+        }
+
+        if (ticket.staff_rating) {
+          return interaction.reply(ephemeralReply({
+            content: `لقد قمت بتقييم الإداري مسبقاً (${'⭐'.repeat(ticket.staff_rating)}).`
+          }));
+        }
+
+        await pool.query(
+          `UPDATE tickets
+           SET staff_rating=$2, rated_by_id=$3, rated_at=NOW()
+           WHERE channel_id=$1`,
+          [interaction.channel.id, rating, interaction.user.id]
+        );
+
+        await addStaffAction(
+          interaction.channel.id,
+          `قيّم الإداري بـ ${rating} من 5`,
+          interaction.user
+        );
+
+        return interaction.reply({
+          content: `شكراً لتقييمك! تم تسجيل تقييمك للإداري: ${'⭐'.repeat(rating)} (${rating}/5).`
+        });
+      }
+
       if (action === 'escalate_to_owner') {
         const lockRes = await runWithLock(`escalate:${interaction.channel.id}`, async () => {
           const ticket = await getTicket(interaction.channel.id);
@@ -1561,9 +1683,9 @@ client.on('interactionCreate', async interaction => {
       if (['claim_ticket', 'record_ticket', 'close_ticket'].includes(action)) {
         const ticket = await getTicket(interaction.channel.id);
 
-        if (!ticket || ticket.status !== 'open') {
+        if (!ticket) {
           return interaction.reply(ephemeralReply({
-            content: 'هذه الشكوى غير موجودة أو مغلقة.'
+            content: 'هذه الشكوى غير موجودة.'
           }));
         }
 
@@ -1574,10 +1696,16 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (action === 'claim_ticket') {
+          if (ticket.status !== 'open') {
+            return interaction.reply(ephemeralReply({
+              content: 'الشكوى مغلقة ولا يمكن استلامها.'
+            }));
+          }
+
           const lockRes = await runWithLock(`claim:${interaction.channel.id}`, async () => {
             const claimed = await pool.query(
               `UPDATE tickets
-               SET claimed_by_id=$2,claimed_by_tag=$3
+               SET claimed_by_id=$2,claimed_by_tag=$3,claimed_at=NOW()
                WHERE channel_id=$1 AND status='open' AND claimed_by_id IS NULL
                RETURNING channel_id`,
               [interaction.channel.id, interaction.user.id, interaction.user.tag]
@@ -1612,32 +1740,47 @@ client.on('interactionCreate', async interaction => {
           const lockRes = await runWithLock(`record:${interaction.channel.id}`, async () => {
             await addStaffAction(
               interaction.channel.id,
-              'قام بتسجيل وأرشفة التذكرة',
+              'قام بتسجيل وأرشفة التذكرة وإرسالها للوق',
               interaction.user
             );
 
-            const number = await sendArchiveToLogChannel(
+            await sendArchiveToLogChannel(
               interaction.guild,
               interaction.channel.id,
-              'تسجيل'
+              'تسجيل التذكرة'
             );
 
-            return interaction.reply(ephemeralReply({
-              content: `تم إرسال أرشيف Ticket-${number} إلى روم السجلات.`
-            }));
+            await pool.query(
+              "UPDATE tickets SET status='closed', closed_at=COALESCE(closed_at, NOW()) WHERE channel_id=$1",
+              [interaction.channel.id]
+            );
+
+            await interaction.reply({
+              content: 'نجحت سيتم حذف التذكره في غضون 5 ثواني'
+            });
+
+            setTimeout(() => {
+              interaction.channel.delete().catch(console.error);
+            }, 5000);
           });
 
           if (lockRes.locked) {
             return interaction.reply(ephemeralReply({
-              content: 'جاري أرشفة التذكرة حالياً...'
+              content: 'جاري تسجيل التذكرة وإرسالها للوق...'
             }));
           }
           return;
         }
 
+        if (ticket.status !== 'open') {
+          return interaction.reply(ephemeralReply({
+            content: 'الشكوى مغلقة مسبقاً والكتابة متوقفة عن الطرفين.'
+          }));
+        }
+
         const modal = new ModalBuilder()
           .setCustomId(`close_reason_modal:${interaction.channel.id}`)
-          .setTitle('إغلاق وأرشفة الشكوى');
+          .setTitle('إغلاق الشكوى');
 
         const reason = new TextInputBuilder()
           .setCustomId('close_reason_input')
@@ -1674,7 +1817,7 @@ client.on('interactionCreate', async interaction => {
         !isStaffMember(interaction.member, ticket)
       ) {
         return interaction.reply(ephemeralReply({
-          content: 'لا تملك صلاحية إغلاق هذه الشكوى.'
+          content: 'لا تملك صلاحية إغلاق هذه الشكوى؛ الإغلاق مخصص للإداريين فقط.'
         }));
       }
 
@@ -1682,44 +1825,37 @@ client.on('interactionCreate', async interaction => {
 
       await pool.query(
         `UPDATE tickets
-         SET closed_at=NOW(),closed_by_id=$2,closed_by_tag=$3,close_reason=$4
+         SET status='closed', closed_at=NOW(), closed_by_id=$2, closed_by_tag=$3, close_reason=$4
          WHERE channel_id=$1`,
         [channelId, interaction.user.id, interaction.user.tag, reason]
       );
 
       await addStaffAction(
         channelId,
-        `أغلق الشكوى — السبب: ${reason}`,
+        `أغلق الشكوى (منع الكتابة من الطرفين) — السبب: ${reason}`,
         interaction.user
       );
 
+      await lockTicketChatForBothParties(interaction.channel, ticket);
+
       await interaction.reply({
-        content: 'تم حفظ الإغلاق وتجهيز الأرشيف. سيتم حذف الروم بعد نجاح إرسال السجل.'
+        content: `🔒 تم إغلاق الشكوى بواسطة <@${interaction.user.id}> وتم إيقاف الكتابة من الطرفين.\n**السبب:** ${reason}`
       });
 
-      try {
-        await sendArchiveToLogChannel(
-          interaction.guild,
-          channelId,
-          'إغلاق'
+      const ratingEmbed = new EmbedBuilder()
+        .setColor(0xc9a65c)
+        .setTitle('⭐ تقييم الإداري')
+        .setDescription(
+          `<@${ticket.opener_id}> يرجى تقييم أداء الإداري ` +
+          (ticket.claimed_by_id ? `<@${ticket.claimed_by_id}>` : 'المسؤول عن الشكوى') +
+          ' باختيار التقييم المناسب أدناه:'
         );
 
-        await pool.query(
-          "UPDATE tickets SET status='closed' WHERE channel_id=$1",
-          [channelId]
-        );
-
-        setTimeout(
-          () => interaction.channel.delete().catch(console.error),
-          3000
-        );
-      } catch (archiveError) {
-        console.error('Archive send failed; ticket channel kept:', archiveError);
-
-        await interaction.followUp(ephemeralReply({
-          content: `تعذر إرسال الأرشيف: ${archiveError.message}. تم الاحتفاظ بالروم والبيانات؛ أعد المحاولة بعد إصلاح روم السجلات.`
-        })).catch(() => {});
-      }
+      await interaction.channel.send({
+        content: `<@${ticket.opener_id}>`,
+        embeds: [ratingEmbed],
+        components: [buildRatingRow()]
+      });
 
       return;
     }
@@ -1867,16 +2003,16 @@ client.on('interactionCreate', async interaction => {
       }
 
       const detailLines = Object.entries(answers)
-        .map(([label, value]) => `**${label}:** ${value || '—'}`)
+        .map(([label, value]) => `**${label} :** ${value || '—'}`)
         .join('\n');
 
       const description = [
         `**رقم التذكرة:** Ticket-${ticketNumber}`,
         `**النوع:** ${type.sectionTitle || 'شكوى'}`,
-        `**الأولوية:** ${type.defaultPriority || 'عادية'}`,
-        `**تم الإنشاء بواسطة:** <@${interaction.user.id}>`,
+        `**صاحب الشكوى:** <@${interaction.user.id}>`,
         detailLines ? `\n${detailLines}` : '',
-        type.evidenceNote || ''
+        type.evidenceNote || '',
+        '\n**تم فتح تذكرتك سوف يتم الرد عليك قريبا**'
       ].filter(Boolean).join('\n');
 
       const embed = new EmbedBuilder()
