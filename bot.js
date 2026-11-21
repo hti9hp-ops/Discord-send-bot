@@ -1765,9 +1765,23 @@ client.on('interactionCreate', async interaction => {
         );
 
         if (existingOpen.rowCount > 0) {
-          return interaction.reply(ephemeralReply({
-            content: `لديك شكوى مفتوحة بالفعل في <#${existingOpen.rows[0].channel_id}>.`
-          }));
+          const prevChannelId = sanitizeSnowflake(existingOpen.rows[0].channel_id);
+          const prevChannel = prevChannelId
+            ? await interaction.guild.channels.fetch(prevChannelId).catch(() => null)
+            : null;
+
+          if (prevChannel && prevChannel.type === ChannelType.GuildText) {
+            return interaction.reply(ephemeralReply({
+              content: `لديك شكوى مفتوحة بالفعل في <#${prevChannel.id}>.`
+            }));
+          }
+
+          if (prevChannelId) {
+            await pool.query(
+              "UPDATE tickets SET status='closed', closed_at=COALESCE(closed_at, NOW()), close_reason=COALESCE(close_reason, 'تم إغلاقها تلقائياً لعدم وجود الروم') WHERE channel_id=$1",
+              [prevChannelId]
+            );
+          }
         }
       }
 
