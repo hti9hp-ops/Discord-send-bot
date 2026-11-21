@@ -3,7 +3,7 @@ const { Pool } = require('pg');
 const {
   Client, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder,
   ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle, EmbedBuilder,
-  AttachmentBuilder, ChannelType, PermissionFlagsBits, REST, Routes,
+  AttachmentBuilder, ChannelType, PermissionFlagsBits, MessageFlags, REST, Routes,
   SlashCommandBuilder
 } = require('discord.js');
 const puppeteer = require('puppeteer-core');
@@ -54,6 +54,14 @@ let cachedConfig = null;
 let lastPanelSignature = '';
 let lastPanelMessageIds = [];
 const actionLocks = new Set();
+
+function ephemeralReply(payload) {
+  const { ephemeral, flags, ...rest } = payload || {};
+  return {
+    ...rest,
+    flags: (flags ?? 0) | MessageFlags.Ephemeral
+  };
+}
 
 function sanitizeSnowflake(val) {
   const s = String(val ?? '').trim();
@@ -205,37 +213,38 @@ function serializeMessage(msg) {
   };
 }
 
-async function syncTicketSequence(clientDb) {
-  await clientDb.query(`
-    SELECT setval(
-      'ticket_number_seq',
-      GREATEST(
-        123::bigint,
-        COALESCE(
-          (
-            SELECT MAX(
-              CASE
-                WHEN regexp_replace(COALESCE(ticket_number, ''), '[^0-9]', '', 'g') ~ '^[0-9]+$'
-                THEN regexp_replace(COALESCE(ticket_number, ''), '[^0-9]', '', 'g')::bigint
-                ELSE 0::bigint
-              END
-            )
-            FROM tickets
-          ),
-          0::bigint
-        )
-      ),
-      true
+async function generateNextTicketNumber(db) {
+  const res = await db.query('SELECT ticket_number FROM tickets');
+  let maxNum = 123;
+
+  for (const row of res.rows) {
+    const digitsOnly = String(row.ticket_number ?? '').replace(/\D+/g, '');
+    if (digitsOnly) {
+      const parsed = Number(digitsOnly);
+      if (Number.isSafeInteger(parsed) && parsed > maxNum) {
+        maxNum = parsed;
+      }
+    }
+  }
+
+  for (let i = 1; i <= 500; i++) {
+    const candidate = String(maxNum + i).padStart(6, '0');
+    const exists = await db.query(
+      'SELECT 1 FROM tickets WHERE ticket_number = $1 LIMIT 1',
+      [candidate]
     );
-  `);
+    if (!exists.rowCount) {
+      return candidate;
+    }
+  }
+
+  return `${Date.now()}`.slice(-6).padStart(6, '0');
 }
 
 async function initDatabase() {
   const clientDb = await pool.connect();
   try {
     await clientDb.query(`
-      CREATE SEQUENCE IF NOT EXISTS ticket_number_seq START WITH 124;
-
       CREATE TABLE IF NOT EXISTS tickets (
         channel_id TEXT PRIMARY KEY,
         guild_id TEXT NOT NULL,
@@ -329,8 +338,6 @@ async function initDatabase() {
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT '';
       ALTER TABLE ticket_staff_actions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     `);
-
-    await syncTicketSequence(clientDb).catch(e => console.warn('syncTicketSequence:', e.message));
 
     await clientDb.query(`CREATE INDEX IF NOT EXISTS tickets_status_idx ON tickets(status);`).catch(e => console.warn('tickets_status_idx:', e.message));
     await clientDb.query(`CREATE INDEX IF NOT EXISTS ticket_messages_channel_idx ON ticket_messages(channel_id, created_at);`).catch(e => console.warn('ticket_messages_channel_idx:', e.message));
@@ -1346,57 +1353,50 @@ client.on('interactionCreate', async interaction => {
 
     if (interaction.isChatInputCommand()) {
       if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
-        return interaction.reply({
-          content: 'هذا الأمر مخصص للأدمن فقط.',
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: 'هذا الأمر مخصص للأدمن فقط.'
+        }));
       }
 
       if (interaction.commandName === 'send-panel') {
         const panelRes = await ensurePanelChannel(cfg, true);
         if (!panelRes?.ok) {
-          return interaction.reply({
-            content: `تعذر إرسال اللوحة: ${panelRes?.reason || 'تحقق من إعدادات روم اللوحة وحفظها من لوحة التحكم.'}`,
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: `تعذر إرسال اللوحة: ${panelRes?.reason || 'تحقق من إعدادات روم اللوحة وحفظها من لوحة التحكم.'}`
+          }));
         }
 
-        return interaction.reply({
-          content: `تم إرسال لوحة الشكاوى بنجاح في ${panelRes.channel}.`,
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: `تم إرسال لوحة الشكاوى بنجاح في ${panelRes.channel}.`
+        }));
       }
 
       if (interaction.commandName === 'send-ticket-panel') {
         const chosenChannel = interaction.options.getChannel('channel');
         const panelRes = await ensurePanelChannel(cfg, true, chosenChannel?.id || '');
         if (!panelRes?.ok) {
-          return interaction.reply({
-            content: `تعذر إرسال بانل الشكوى: ${panelRes?.reason || 'تحقق من إعدادات روم الشكاوى في لوحة التحكم.'}`,
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: `تعذر إرسال بانل الشكوى: ${panelRes?.reason || 'تحقق من إعدادات روم الشكاوى في لوحة التحكم.'}`
+          }));
         }
 
-        return interaction.reply({
-          content: `تم إرسال بانل الشكوى إلى ${panelRes.channel}.`,
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: `تم إرسال بانل الشكوى إلى ${panelRes.channel}.`
+        }));
       }
 
       if (interaction.commandName === 'send-stats') {
         const chosenChannel = interaction.options.getChannel('channel');
         const statsRes = await sendStatsToChannel(interaction.guild, cfg, chosenChannel);
         if (!statsRes?.ok) {
-          return interaction.reply({
-            content: `تعذر إرسال الإحصائيات: ${statsRes?.reason || 'تحقق من إعدادات شات الإحصائيات.'}`,
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: `تعذر إرسال الإحصائيات: ${statsRes?.reason || 'تحقق من إعدادات شات الإحصائيات.'}`
+          }));
         }
 
-        return interaction.reply({
-          content: `تم إرسال الإحصائيات بنجاح في ${statsRes.channel}.`,
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: `تم إرسال الإحصائيات بنجاح في ${statsRes.channel}.`
+        }));
       }
     }
 
@@ -1408,10 +1408,9 @@ client.on('interactionCreate', async interaction => {
         const type = rawType ? normalizeTicketType(rawType) : null;
 
         if (!type) {
-          return interaction.reply({
-            content: 'هذا النوع غير متوفر حالياً.',
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: 'هذا النوع غير متوفر حالياً.'
+          }));
         }
 
         const allowedRoles = Array.isArray(type.allowedRoleIds)
@@ -1422,10 +1421,9 @@ client.on('interactionCreate', async interaction => {
           allowedRoles.length &&
           !interaction.member.roles.cache.some(r => allowedRoles.includes(r.id))
         ) {
-          return interaction.reply({
-            content: 'عذراً، هذا النوع من الشكاوى غير متاح لرولك.',
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: 'عذراً، هذا النوع من الشكاوى غير متاح لرولك.'
+          }));
         }
 
         const modal = new ModalBuilder()
@@ -1457,92 +1455,62 @@ client.on('interactionCreate', async interaction => {
           const ticket = await getTicket(interaction.channel.id);
 
           if (!ticket || ticket.status !== 'open') {
-            return interaction.reply({
-              content: 'هذه الشكوى غير موجودة أو مغلقة.',
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: 'هذه الشكوى غير موجودة أو مغلقة.'
+            }));
           }
 
           const type = normalizeTicketType(ticket.type_config);
           if (!isOwnerEscalationEnabled(type)) {
-            return interaction.reply({
-              content: 'زر التحويل إلى أونر غير مفعّل لهذا النوع من الشكاوى.',
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: 'زر التحويل إلى أونر غير مفعّل لهذا النوع من الشكاوى.'
+            }));
           }
 
           if (!isStaffMember(interaction.member, ticket)) {
-            return interaction.reply({
-              content: 'هذا الإجراء متاح للرولات الإدارية فقط.',
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: 'هذا الإجراء متاح للرولات الإدارية فقط.'
+            }));
           }
 
           if (ticket.escalated_to_owner) {
-            return interaction.reply({
-              content: 'تم تحويل هذه الشكوى إلى أونر مسبقاً.',
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: 'تم تحويل هذه الشكوى إلى أونر مسبقاً.'
+            }));
           }
 
           const { ownerRoleId, ownerCategoryId } = resolveOwnerEscalationTarget(type);
           if (!ownerRoleId || !ownerCategoryId) {
-            return interaction.reply({
-              content: 'لم يتم تحديد رول الأونر أو كاتكوري التحويل من لوحة التحكم.',
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: 'لم يتم تحديد رول الأونر أو كاتكوري التحويل من لوحة التحكم.'
+            }));
           }
 
-          const dbClient = await pool.connect();
-          try {
-            await dbClient.query('BEGIN');
-            const lockedRow = await dbClient.query(
-              'SELECT escalated_to_owner FROM tickets WHERE channel_id=$1 AND status=$2 FOR UPDATE',
-              [interaction.channel.id, 'open']
-            );
-            if (!lockedRow.rows.length || lockedRow.rows[0].escalated_to_owner) {
-              await dbClient.query('ROLLBACK');
-              return interaction.reply({
-                content: 'تم تحويل هذه الشكوى إلى أونر مسبقاً.',
-                ephemeral: true
-              });
-            }
+          const targetCategory = await interaction.guild.channels
+            .fetch(ownerCategoryId)
+            .catch(() => null);
 
-            const targetCategory = await interaction.guild.channels
-              .fetch(ownerCategoryId)
-              .catch(() => null);
-
-            if (!targetCategory || targetCategory.type !== ChannelType.GuildCategory) {
-              await dbClient.query('ROLLBACK');
-              return interaction.reply({
-                content: 'الكاتكوري المحدد للتحويل غير موجود أو غير صالح.',
-                ephemeral: true
-              });
-            }
-
-            await interaction.channel.permissionOverwrites.edit(ownerRoleId, {
-              ViewChannel: true,
-              SendMessages: true,
-              ReadMessageHistory: true,
-              AttachFiles: true
-            });
-
-            await interaction.channel.setParent(targetCategory.id, { lockPermissions: false });
-
-            await dbClient.query(
-              `UPDATE tickets
-               SET escalated_to_owner=TRUE, escalated_at=NOW(), escalated_by_id=$2, escalated_by_tag=$3
-               WHERE channel_id=$1`,
-              [interaction.channel.id, interaction.user.id, interaction.user.tag]
-            );
-
-            await dbClient.query('COMMIT');
-          } catch (err) {
-            await dbClient.query('ROLLBACK').catch(() => {});
-            throw err;
-          } finally {
-            dbClient.release();
+          if (!targetCategory || targetCategory.type !== ChannelType.GuildCategory) {
+            return interaction.reply(ephemeralReply({
+              content: 'الكاتكوري المحدد للتحويل غير موجود أو غير صالح.'
+            }));
           }
+
+          await interaction.channel.permissionOverwrites.edit(ownerRoleId, {
+            ViewChannel: true,
+            SendMessages: true,
+            ReadMessageHistory: true,
+            AttachFiles: true
+          });
+
+          await interaction.channel.setParent(targetCategory.id, { lockPermissions: false });
+
+          await pool.query(
+            `UPDATE tickets
+             SET escalated_to_owner=TRUE, escalated_at=NOW(), escalated_by_id=$2, escalated_by_tag=$3
+             WHERE channel_id=$1`,
+            [interaction.channel.id, interaction.user.id, interaction.user.tag]
+          );
 
           await addStaffAction(
             interaction.channel.id,
@@ -1566,17 +1534,15 @@ client.on('interactionCreate', async interaction => {
             allowedMentions: { roles: [ownerRoleId] }
           });
 
-          return interaction.reply({
-            content: `تم تحويل الشكوى إلى <@&${ownerRoleId}> ونقلها إلى <#${ownerCategoryId}>.`,
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: `تم تحويل الشكوى إلى <@&${ownerRoleId}> ونقلها إلى <#${ownerCategoryId}>.`
+          }));
         });
 
         if (lockRes.locked) {
-          return interaction.reply({
-            content: 'جاري تنفيذ عملية التحويل حالياً...',
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: 'جاري تنفيذ عملية التحويل حالياً...'
+          }));
         }
         return;
       }
@@ -1585,17 +1551,15 @@ client.on('interactionCreate', async interaction => {
         const ticket = await getTicket(interaction.channel.id);
 
         if (!ticket || ticket.status !== 'open') {
-          return interaction.reply({
-            content: 'هذه الشكوى غير موجودة أو مغلقة.',
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: 'هذه الشكوى غير موجودة أو مغلقة.'
+          }));
         }
 
         if (!isStaffMember(interaction.member, ticket)) {
-          return interaction.reply({
-            content: 'هذا الإجراء متاح للرولات الإدارية فقط.',
-            ephemeral: true
-          });
+          return interaction.reply(ephemeralReply({
+            content: 'هذا الإجراء متاح للرولات الإدارية فقط.'
+          }));
         }
 
         if (action === 'claim_ticket') {
@@ -1609,10 +1573,9 @@ client.on('interactionCreate', async interaction => {
             );
 
             if (!claimed.rowCount) {
-              return interaction.reply({
-                content: 'الشكوى مستلمة مسبقاً أو لم تعد مفتوحة.',
-                ephemeral: true
-              });
+              return interaction.reply(ephemeralReply({
+                content: 'الشكوى مستلمة مسبقاً أو لم تعد مفتوحة.'
+              }));
             }
 
             await addStaffAction(
@@ -1627,10 +1590,9 @@ client.on('interactionCreate', async interaction => {
           });
 
           if (lockRes.locked) {
-            return interaction.reply({
-              content: 'جاري معالجة الاستلام...',
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: 'جاري معالجة الاستلام...'
+            }));
           }
           return;
         }
@@ -1649,17 +1611,15 @@ client.on('interactionCreate', async interaction => {
               'تسجيل'
             );
 
-            return interaction.reply({
-              content: `تم إرسال أرشيف Ticket-${number} إلى روم السجلات.`,
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: `تم إرسال أرشيف Ticket-${number} إلى روم السجلات.`
+            }));
           });
 
           if (lockRes.locked) {
-            return interaction.reply({
-              content: 'جاري أرشفة التذكرة حالياً...',
-              ephemeral: true
-            });
+            return interaction.reply(ephemeralReply({
+              content: 'جاري أرشفة التذكرة حالياً...'
+            }));
           }
           return;
         }
@@ -1690,10 +1650,9 @@ client.on('interactionCreate', async interaction => {
       const channelId = interaction.customId.split(':')[1];
 
       if (interaction.channelId !== channelId) {
-        return interaction.reply({
-          content: 'طلب غير صالح.',
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: 'طلب غير صالح.'
+        }));
       }
 
       const ticket = await getTicket(channelId);
@@ -1703,10 +1662,9 @@ client.on('interactionCreate', async interaction => {
         ticket.status !== 'open' ||
         !isStaffMember(interaction.member, ticket)
       ) {
-        return interaction.reply({
-          content: 'لا تملك صلاحية إغلاق هذه الشكوى.',
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: 'لا تملك صلاحية إغلاق هذه الشكوى.'
+        }));
       }
 
       const reason = interaction.fields.getTextInputValue('close_reason_input');
@@ -1747,10 +1705,9 @@ client.on('interactionCreate', async interaction => {
       } catch (archiveError) {
         console.error('Archive send failed; ticket channel kept:', archiveError);
 
-        await interaction.followUp({
-          content: `تعذر إرسال الأرشيف: ${archiveError.message}. تم الاحتفاظ بالروم والبيانات؛ أعد المحاولة بعد إصلاح روم السجلات.`,
-          ephemeral: true
-        }).catch(() => {});
+        await interaction.followUp(ephemeralReply({
+          content: `تعذر إرسال الأرشيف: ${archiveError.message}. تم الاحتفاظ بالروم والبيانات؛ أعد المحاولة بعد إصلاح روم السجلات.`
+        })).catch(() => {});
       }
 
       return;
@@ -1765,10 +1722,9 @@ client.on('interactionCreate', async interaction => {
       const type = rawType ? normalizeTicketType(rawType) : null;
 
       if (!type) {
-        return interaction.reply({
-          content: 'تعذر العثور على إعدادات نوع الشكوى.',
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: 'تعذر العثور على إعدادات نوع الشكوى.'
+        }));
       }
 
       const allowedRoles = Array.isArray(type.allowedRoleIds)
@@ -1779,10 +1735,9 @@ client.on('interactionCreate', async interaction => {
         allowedRoles.length &&
         !interaction.member.roles.cache.some(r => allowedRoles.includes(r.id))
       ) {
-        return interaction.reply({
-          content: 'عذراً، هذا النوع من الشكاوى غير متاح لرولك.',
-          ephemeral: true
-        });
+        return interaction.reply(ephemeralReply({
+          content: 'عذراً، هذا النوع من الشكاوى غير متاح لرولك.'
+        }));
       }
 
       const answers = {};
@@ -1791,6 +1746,21 @@ client.on('interactionCreate', async interaction => {
         answers[field.label || `حقل ${index + 1}`] =
           interaction.fields.getTextInputValue(`field_${index}`);
       });
+
+      if (!cfg.allowMultipleTicketsPerUser) {
+        const existingOpen = await pool.query(
+          "SELECT channel_id FROM tickets WHERE guild_id=$1 AND opener_id=$2 AND status='open' LIMIT 1",
+          [interaction.guild.id, interaction.user.id]
+        );
+
+        if (existingOpen.rowCount > 0) {
+          return interaction.reply(ephemeralReply({
+            content: `لديك شكوى مفتوحة بالفعل في <#${existingOpen.rows[0].channel_id}>.`
+          }));
+        }
+      }
+
+      const ticketNumber = await generateNextTicketNumber(pool);
 
       const overwrites = [
         {
@@ -1830,59 +1800,15 @@ client.on('interactionCreate', async interaction => {
         });
       });
 
-      let channel = null;
-      let ticketNumber = null;
-      const dbClient = await pool.connect();
+      const channel = await interaction.guild.channels.create({
+        name: `ticket-${ticketNumber}`,
+        type: ChannelType.GuildText,
+        parent: type.categoryId || null,
+        permissionOverwrites: overwrites
+      });
 
       try {
-        await dbClient.query('BEGIN');
-
-        if (!cfg.allowMultipleTicketsPerUser) {
-          const existingOpen = await dbClient.query(
-            "SELECT channel_id FROM tickets WHERE guild_id=$1 AND opener_id=$2 AND status='open' LIMIT 1",
-            [interaction.guild.id, interaction.user.id]
-          );
-
-          if (existingOpen.rowCount > 0) {
-            await dbClient.query('ROLLBACK');
-            return interaction.reply({
-              content: `لديك شكوى مفتوحة بالفعل في <#${existingOpen.rows[0].channel_id}>.`,
-              ephemeral: true
-            });
-          }
-        }
-
-        await syncTicketSequence(dbClient).catch(() => {});
-
-        let inserted = false;
-        for (let attempt = 0; attempt < 20; attempt++) {
-          const numberResult = await dbClient.query(
-            "SELECT nextval('ticket_number_seq') AS n"
-          );
-          const candidateNumber = String(numberResult.rows[0].n).padStart(6, '0');
-          const existsNum = await dbClient.query(
-            'SELECT 1 FROM tickets WHERE ticket_number=$1 LIMIT 1',
-            [candidateNumber]
-          );
-          if (!existsNum.rowCount) {
-            ticketNumber = candidateNumber;
-            inserted = true;
-            break;
-          }
-        }
-
-        if (!inserted || !ticketNumber) {
-          throw new Error('تعذر توليد رقم شكوى فريد جديد.');
-        }
-
-        channel = await interaction.guild.channels.create({
-          name: `ticket-${ticketNumber}`,
-          type: ChannelType.GuildText,
-          parent: type.categoryId || null,
-          permissionOverwrites: overwrites
-        });
-
-        await dbClient.query(
+        await pool.query(
           `INSERT INTO tickets(
             channel_id,guild_id,ticket_number,user_id,user_tag,opener_id,opener_tag,type_config,answers
           )
@@ -1900,7 +1826,7 @@ client.on('interactionCreate', async interaction => {
           ]
         );
 
-        await dbClient.query(
+        await pool.query(
           `INSERT INTO ticket_staff_actions(channel_id,actor_id,actor_tag,action)
            VALUES($1,$2,$3,$4)`,
           [
@@ -1910,14 +1836,9 @@ client.on('interactionCreate', async interaction => {
             `فتح الشكوى (النوع: ${type.sectionTitle || 'غير محدد'})`
           ]
         );
-
-        await dbClient.query('COMMIT');
       } catch (dbError) {
-        await dbClient.query('ROLLBACK').catch(() => {});
-        if (channel) await channel.delete().catch(() => {});
+        await channel.delete().catch(() => {});
         throw dbError;
-      } finally {
-        dbClient.release();
       }
 
       const detailLines = Object.entries(answers)
@@ -1953,10 +1874,9 @@ client.on('interactionCreate', async interaction => {
         components: [buttons]
       });
 
-      return interaction.reply({
-        content: `تم فتح شكواك بنجاح: ${channel}`,
-        ephemeral: true
-      });
+      return interaction.reply(ephemeralReply({
+        content: `تم فتح شكواك بنجاح: ${channel}`
+      }));
     }
   } catch (error) {
     console.error('Interaction error:', error);
@@ -1965,15 +1885,13 @@ client.on('interactionCreate', async interaction => {
       `حدث خطأ أثناء تنفيذ العملية: ${String(error.message || error).slice(0, 700)}`;
 
     if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({
-        content: message,
-        ephemeral: true
-      }).catch(() => {});
+      await interaction.followUp(ephemeralReply({
+        content: message
+      })).catch(() => {});
     } else {
-      await interaction.reply({
-        content: message,
-        ephemeral: true
-      }).catch(() => {});
+      await interaction.reply(ephemeralReply({
+        content: message
+      })).catch(() => {});
     }
   }
 });
