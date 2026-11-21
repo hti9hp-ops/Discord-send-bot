@@ -99,6 +99,12 @@ function normalizeTicketType(rawType) {
     categoryId: sanitizeSnowflake(t.categoryId),
     allowedRoleIds: sanitizeSnowflakeArray(t.allowedRoleIds),
     staffRoleIds: sanitizeSnowflakeArray(t.staffRoleIds),
+    addAllowedRoleIds: sanitizeSnowflakeArray(
+      t.addAllowedRoleIds ?? t.addMemberRoleIds ?? t.addRoleIds
+    ),
+    reopenAllowedRoleIds: sanitizeSnowflakeArray(
+      t.reopenAllowedRoleIds ?? t.reopenRoleIds ?? t.allowReopenRoleIds
+    ),
     fields: Array.isArray(t.fields) ? t.fields : [],
     evidenceNote: String(t.evidenceNote || ''),
     escalateToOwnerEnabled: escalateEnabled,
@@ -119,6 +125,12 @@ function normalizeConfig(raw) {
     goodbyeChannelId: sanitizeSnowflake(cfg.goodbyeChannelId),
     ownerEscalationRoleId: sanitizeSnowflake(cfg.ownerEscalationRoleId || cfg.ownerRoleId),
     ownerEscalationCategoryId: sanitizeSnowflake(cfg.ownerEscalationCategoryId || cfg.ownerCategoryId),
+    addAllowedRoleIds: sanitizeSnowflakeArray(
+      cfg.addAllowedRoleIds ?? cfg.addMemberRoleIds ?? cfg.addRoleIds
+    ),
+    reopenAllowedRoleIds: sanitizeSnowflakeArray(
+      cfg.reopenAllowedRoleIds ?? cfg.reopenRoleIds ?? cfg.allowReopenRoleIds
+    ),
     allowMultipleTicketsPerUser: Boolean(cfg.allowMultipleTicketsPerUser),
     ticketTypes: Array.isArray(cfg.ticketTypes) ? cfg.ticketTypes.map(normalizeTicketType) : []
   };
@@ -210,6 +222,12 @@ function formatDuration(startVal, endVal) {
   return parts.join(' ');
 }
 
+function formatRatingBadge(rating) {
+  const n = Number(rating);
+  if (!n || n < 1 || n > 5) return 'لم يُقيّم بعد';
+  return `${n}🌟`;
+}
+
 function formatText(template, member, guild) {
   return (template || '')
     .replace(/\{user\}/g, member ? `<@${member.id}>` : '')
@@ -295,6 +313,10 @@ async function initDatabase() {
         staff_rating INTEGER,
         rated_by_id TEXT,
         rated_at TIMESTAMPTZ,
+        reopen_count INTEGER NOT NULL DEFAULT 0,
+        reopened_at TIMESTAMPTZ,
+        reopened_by_id TEXT,
+        reopened_by_tag TEXT,
         escalated_to_owner BOOLEAN NOT NULL DEFAULT FALSE,
         escalated_at TIMESTAMPTZ,
         escalated_by_id TEXT,
@@ -323,6 +345,10 @@ async function initDatabase() {
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS staff_rating INTEGER;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS rated_by_id TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS rated_at TIMESTAMPTZ;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reopen_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reopened_at TIMESTAMPTZ;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reopened_by_id TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reopened_by_tag TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_to_owner BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_at TIMESTAMPTZ;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_by_id TEXT;
@@ -788,6 +814,40 @@ function isStaffMember(member, ticket) {
     staffRoles.some(id => member.roles.cache.has(id));
 }
 
+function canUseAddButton(member, ticket) {
+  if (!member || !ticket) return false;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+
+  const type = normalizeTicketType(ticket.type_config);
+  const cfg = normalizeConfig(cachedConfig || {});
+  const allowedRoles = type.addAllowedRoleIds.length
+    ? type.addAllowedRoleIds
+    : cfg.addAllowedRoleIds;
+
+  if (allowedRoles.length) {
+    return allowedRoles.some(id => member.roles.cache.has(id));
+  }
+
+  return isStaffMember(member, ticket);
+}
+
+function canReopenTicket(member, ticket) {
+  if (!member || !ticket) return false;
+  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+
+  const type = normalizeTicketType(ticket.type_config);
+  const cfg = normalizeConfig(cachedConfig || {});
+  const allowedRoles = type.reopenAllowedRoleIds.length
+    ? type.reopenAllowedRoleIds
+    : cfg.reopenAllowedRoleIds;
+
+  if (allowedRoles.length) {
+    return allowedRoles.some(id => member.roles.cache.has(id));
+  }
+
+  return isStaffMember(member, ticket);
+}
+
 function isOwnerEscalationEnabled(ticketType) {
   return Boolean(normalizeTicketType(ticketType).escalateToOwnerEnabled);
 }
@@ -846,11 +906,24 @@ function buildTicketActionRow(ticketType) {
 
 function buildRatingRow() {
   return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('rate_staff:1').setLabel('⭐ 1').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('rate_staff:2').setLabel('⭐⭐ 2').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('rate_staff:3').setLabel('⭐⭐⭐ 3').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId('rate_staff:4').setLabel('⭐⭐⭐⭐ 4').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId('rate_staff:5').setLabel('⭐⭐⭐⭐⭐ 5').setStyle(ButtonStyle.Success)
+    new ButtonBuilder().setCustomId('rate_staff:1').setLabel('1🌟').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rate_staff:2').setLabel('2🌟').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rate_staff:3').setLabel('3🌟').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('rate_staff:4').setLabel('4🌟').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('rate_staff:5').setLabel('5🌟').setStyle(ButtonStyle.Success)
+  );
+}
+
+function buildClosedTicketRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('reopen_ticket')
+      .setLabel('إعادة فتح الشكوى')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId('record_ticket')
+      .setLabel('تسجيل التذكرة')
+      .setStyle(ButtonStyle.Danger)
   );
 }
 
@@ -867,6 +940,25 @@ async function lockTicketChatForBothParties(channel, ticket) {
     await channel.permissionOverwrites.edit(targetId, {
       SendMessages: false
     }).catch(err => console.warn(`Lock overwrite failed for ${targetId}:`, err.message));
+  }
+}
+
+async function unlockTicketChatForBothParties(channel, ticket) {
+  if (!channel || !ticket) return;
+
+  const participantIds = [...new Set([
+    sanitizeSnowflake(ticket.opener_id),
+    sanitizeSnowflake(ticket.claimed_by_id),
+    ...(Array.isArray(ticket.type_config?.staffRoleIds) ? ticket.type_config.staffRoleIds : [])
+  ].filter(Boolean))];
+
+  for (const targetId of participantIds) {
+    await channel.permissionOverwrites.edit(targetId, {
+      ViewChannel: true,
+      SendMessages: true,
+      ReadMessageHistory: true,
+      AttachFiles: true
+    }).catch(err => console.warn(`Unlock overwrite failed for ${targetId}:`, err.message));
   }
 }
 
@@ -944,6 +1036,7 @@ async function fetchTicketArchive(channelId) {
       ? `${ticket.claimed_by_tag} (${ticket.claimed_by_id})`
       : null,
     staffRating: ticket.staff_rating,
+    reopenCount: Number(ticket.reopen_count || 0),
     escalatedToOwner: Boolean(ticket.escalated_to_owner),
     escalatedBy: ticket.escalated_by_tag
       ? `${ticket.escalated_by_tag} (${ticket.escalated_by_id})`
@@ -1048,7 +1141,8 @@ function generateArchiveHtml(data) {
   <div><b>صاحب الشكوى:</b> ${escapeHtml(data.openerTag)} (${escapeHtml(data.openerId)})</div>
   <div><b>روم الشكوى:</b> ${escapeHtml(data.channelId)}</div>
   <div><b>الإداري المستلم:</b> ${escapeHtml(data.claimedBy || 'لم يُستلم')}</div>
-  <div><b>تقييم الإدارة:</b> ${data.staffRating ? `${'⭐'.repeat(data.staffRating)} (${data.staffRating}/5)` : 'لم يُقيّم بعد'}</div>
+  <div><b>تقييم الإدارة:</b> ${escapeHtml(formatRatingBadge(data.staffRating))}</div>
+  <div><b>إعادة الفتح:</b> عدد المرات: ${escapeHtml(String(data.reopenCount || 0))}</div>
   <div><b>تحويل إلى أونر:</b> ${data.escalatedToOwner ? `نعم (${escapeHtml(data.escalatedBy || '')})` : 'لا'}</div>
   <div><b>تاريخ الفتح:</b> ${escapeHtml(formatDateTime(data.openedAt))}</div>
   <div><b>تاريخ الإغلاق:</b> ${escapeHtml(formatDateTime(data.closedAt))}</div>
@@ -1073,7 +1167,8 @@ function generateArchiveText(data) {
     `تاريخ الفتح: ${formatDateTime(data.openedAt)}`,
     `تاريخ الإغلاق: ${formatDateTime(data.closedAt)}`,
     `الإداري المستلم: ${data.claimedBy || 'لم يستلم'}`,
-    `تقييم الإدارة: ${data.staffRating ? `${data.staffRating}/5` : 'لم يُقيّم بعد'}`,
+    `تقييم الإدارة: ${formatRatingBadge(data.staffRating)}`,
+    `إعادة الفتح: عدد المرات: ${data.reopenCount || 0}`,
     `تحويل إلى أونر: ${data.escalatedToOwner ? `نعم (${data.escalatedBy || ''})` : 'لا'}`,
     `من أغلقها: ${data.closedBy || '—'}`,
     `سبب الإغلاق: ${data.closeReason || '—'}`,
@@ -1150,9 +1245,7 @@ function buildDetailedLogEmbed(data, modeLabel) {
     ? formatDuration(data.claimedAt, data.closedAt || new Date())
     : '—';
 
-  const ratingText = data.staffRating
-    ? `${'⭐'.repeat(data.staffRating)} (${data.staffRating}/5)`
-    : 'لم يُقيّم بعد';
+  const ratingText = formatRatingBadge(data.staffRating);
 
   const description = [
     `**صاحب الشكوى**\n<@${data.openerId}> (${escapeHtml(data.openerTag)})`,
@@ -1166,7 +1259,7 @@ function buildDetailedLogEmbed(data, modeLabel) {
     `**مدة المعالجة (استلام ← إغلاق)**\n${claimToClose}`,
     `**تقييم الإدارة**\n${ratingText}`,
     `**نوع السجل**\n${modeLabel}`,
-    `**إعادة الفتح**\nعدد المرات: 0`,
+    `**إعادة الفتح**\nعدد المرات: ${data.reopenCount || 0}`,
     data.closeReason ? `**سبب الإغلاق**\n${data.closeReason}` : '',
     `**وصف الشكوى**\n${answersText}`
   ].filter(Boolean).join('\n\n').slice(0, 4096);
@@ -1517,7 +1610,7 @@ client.on('interactionCreate', async interaction => {
       const channelId = interaction.customId.split(':')[1];
       const ticket = await getTicket(channelId);
 
-      if (!ticket || ticket.status !== 'open' || !isStaffMember(interaction.member, ticket)) {
+      if (!ticket || ticket.status !== 'open' || !canUseAddButton(interaction.member, ticket)) {
         return interaction.reply(ephemeralReply({
           content: 'لا تملك صلاحية إضافة رولات لهذه الشكوى.'
         }));
@@ -1554,7 +1647,7 @@ client.on('interactionCreate', async interaction => {
       const channelId = interaction.customId.split(':')[1];
       const ticket = await getTicket(channelId);
 
-      if (!ticket || ticket.status !== 'open' || !isStaffMember(interaction.member, ticket)) {
+      if (!ticket || ticket.status !== 'open' || !canUseAddButton(interaction.member, ticket)) {
         return interaction.reply(ephemeralReply({
           content: 'لا تملك صلاحية إضافة أعضاء لهذه الشكوى.'
         }));
@@ -1655,7 +1748,7 @@ client.on('interactionCreate', async interaction => {
 
         if (ticket.staff_rating) {
           return interaction.reply(ephemeralReply({
-            content: `لقد قمت بتقييم الإداري مسبقاً (${'⭐'.repeat(ticket.staff_rating)}).`
+            content: `لقد قمت بتقييم الإداري مسبقاً (${formatRatingBadge(ticket.staff_rating)}).`
           }));
         }
 
@@ -1668,13 +1761,67 @@ client.on('interactionCreate', async interaction => {
 
         await addStaffAction(
           interaction.channel.id,
-          `قيّم الإداري بـ ${rating} من 5`,
+          `قيّم الإداري بـ ${formatRatingBadge(rating)}`,
           interaction.user
         );
 
         return interaction.reply({
-          content: `شكراً لتقييمك! تم تسجيل تقييمك للإداري: ${'⭐'.repeat(rating)} (${rating}/5).`
+          content: `شكراً لتقييمك! تم تسجيل تقييمك للإداري: ${formatRatingBadge(rating)}`
         });
+      }
+
+      if (action === 'reopen_ticket') {
+        const lockRes = await runWithLock(`reopen:${interaction.channel.id}`, async () => {
+          const ticket = await getTicket(interaction.channel.id);
+
+          if (!ticket) {
+            return interaction.reply(ephemeralReply({
+              content: 'تعذر العثور على بيانات هذه الشكوى.'
+            }));
+          }
+
+          if (ticket.status === 'open') {
+            return interaction.reply(ephemeralReply({
+              content: 'الشكوى مفتوحة بالفعل.'
+            }));
+          }
+
+          if (!canReopenTicket(interaction.member, ticket)) {
+            return interaction.reply(ephemeralReply({
+              content: 'لا تملك صلاحية إعادة فتح هذه الشكوى حسب إعدادات الرولات في لوحة التحكم.'
+            }));
+          }
+
+          await pool.query(
+            `UPDATE tickets
+             SET status='open',
+                 reopen_count=COALESCE(reopen_count, 0) + 1,
+                 reopened_at=NOW(),
+                 reopened_by_id=$2,
+                 reopened_by_tag=$3
+             WHERE channel_id=$1`,
+            [interaction.channel.id, interaction.user.id, interaction.user.tag]
+          );
+
+          await unlockTicketChatForBothParties(interaction.channel, ticket);
+
+          await addStaffAction(
+            interaction.channel.id,
+            'أعاد فتح الشكوى وفتح الكتابة للطرفين',
+            interaction.user
+          );
+
+          return interaction.reply({
+            content: `🔓 تمت إعادة فتح الشكوى بواسطة <@${interaction.user.id}> وتم فتح الكتابة للطرفين.`
+          });
+        });
+
+        if (lockRes.locked) {
+          return interaction.reply(ephemeralReply({
+            content: 'جاري إعادة فتح الشكوى...'
+          }));
+        }
+        return;
       }
 
       if (action === 'escalate_to_owner') {
@@ -1789,9 +1936,9 @@ client.on('interactionCreate', async interaction => {
           }));
         }
 
-        if (!isStaffMember(interaction.member, ticket)) {
+        if (!canUseAddButton(interaction.member, ticket)) {
           return interaction.reply(ephemeralReply({
-            content: 'هذا الإجراء متاح للرولات الإدارية فقط.'
+            content: 'لا تملك صلاحية استخدام زر الإضافة حسب إعدادات الرولات في لوحة التحكم.'
           }));
         }
 
@@ -1975,7 +2122,8 @@ client.on('interactionCreate', async interaction => {
       await lockTicketChatForBothParties(interaction.channel, ticket);
 
       await interaction.reply({
-        content: `🔒 تم إغلاق الشكوى بواسطة <@${interaction.user.id}> وتم إيقاف الكتابة من الطرفين.\n**السبب:** ${reason}`
+        content: `🔒 تم إغلاق الشكوى بواسطة <@${interaction.user.id}> وتم إيقاف الكتابة من الطرفين.\n**السبب:** ${reason}`,
+        components: [buildClosedTicketRow()]
       });
 
       const ratingEmbed = new EmbedBuilder()
