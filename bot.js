@@ -73,6 +73,15 @@ function sanitizeSnowflakeArray(arr) {
   return [...new Set(arr.map(sanitizeSnowflake).filter(Boolean))];
 }
 
+const TARGET_CONTROL_ROLE_IDS = sanitizeSnowflakeArray([
+  '1538537109865107507',
+  '1538532272087506984',
+  '1538538719211036703'
+]);
+
+const ADD_BUTTON_ALLOWED_ROLE_IDS = [...TARGET_CONTROL_ROLE_IDS];
+const REOPEN_ALLOWED_ROLE_IDS = [...TARGET_CONTROL_ROLE_IDS];
+
 function normalizeTicketType(rawType) {
   const t = rawType && typeof rawType === 'object' ? rawType : {};
   const escalateEnabled = Boolean(
@@ -81,12 +90,7 @@ function normalizeTicketType(rawType) {
     t.escalateEnabled ??
     false
   );
-  const addEnabled = Boolean(
-    t.addMemberEnabled ??
-    t.addButtonEnabled ??
-    t.allowAddMembers ??
-    false
-  );
+  const addEnabled = t.addMemberEnabled === false ? false : true;
 
   return {
     ...t,
@@ -818,6 +822,10 @@ function canUseAddButton(member, ticket) {
   if (!member || !ticket) return false;
   if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
 
+  if (ADD_BUTTON_ALLOWED_ROLE_IDS.length) {
+    return ADD_BUTTON_ALLOWED_ROLE_IDS.some(id => member.roles.cache.has(id));
+  }
+
   const type = normalizeTicketType(ticket.type_config);
   const cfg = normalizeConfig(cachedConfig || {});
   const allowedRoles = type.addAllowedRoleIds.length
@@ -834,6 +842,10 @@ function canUseAddButton(member, ticket) {
 function canReopenTicket(member, ticket) {
   if (!member || !ticket) return false;
   if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
+
+  if (REOPEN_ALLOWED_ROLE_IDS.length) {
+    return REOPEN_ALLOWED_ROLE_IDS.some(id => member.roles.cache.has(id));
+  }
 
   const type = normalizeTicketType(ticket.type_config);
   const cfg = normalizeConfig(cachedConfig || {});
@@ -1780,15 +1792,9 @@ client.on('interactionCreate', async interaction => {
             }));
           }
 
-          if (ticket.status === 'open') {
-            return interaction.reply(ephemeralReply({
-              content: 'الشكوى مفتوحة بالفعل.'
-            }));
-          }
-
           if (!canReopenTicket(interaction.member, ticket)) {
             return interaction.reply(ephemeralReply({
-              content: 'لا تملك صلاحية إعادة فتح هذه الشكوى حسب إعدادات الرولات في لوحة التحكم.'
+              content: 'لا تملك صلاحية إعادة فتح هذه الشكوى؛ الزر مخصص للرولات المحددة فقط.'
             }));
           }
 
@@ -1938,7 +1944,7 @@ client.on('interactionCreate', async interaction => {
 
         if (!canUseAddButton(interaction.member, ticket)) {
           return interaction.reply(ephemeralReply({
-            content: 'لا تملك صلاحية استخدام زر الإضافة حسب إعدادات الرولات في لوحة التحكم.'
+            content: 'لا تملك صلاحية استخدام زر الإضافة؛ الزر مخصص للرولات المحددة فقط.'
           }));
         }
 
@@ -1970,6 +1976,14 @@ client.on('interactionCreate', async interaction => {
           return interaction.reply(ephemeralReply({
             content: 'هذه الشكوى غير موجودة.'
           }));
+        }
+
+        if (action === 'record_ticket') {
+          if (ticket.status !== 'closed') {
+            return interaction.reply(ephemeralReply({
+              content: 'أغلق التذكرة أولاً'
+            }));
+          }
         }
 
         if (!isStaffMember(interaction.member, ticket)) {
@@ -2039,7 +2053,15 @@ client.on('interactionCreate', async interaction => {
             );
 
             await interaction.reply({
-              content: 'نجحت سيتم حذف التذكره في غضون 5 ثواني'
+              content: 'نجحت سيتم حذف التذكره في غضون 5 ثواني',
+              components: [
+                new ActionRowBuilder().addComponents(
+                  new ButtonBuilder()
+                    .setCustomId('reopen_ticket')
+                    .setLabel('إعادة فتح الشكوى')
+                    .setStyle(ButtonStyle.Success)
+                )
+              ]
             });
 
             setTimeout(() => {
