@@ -233,6 +233,20 @@ async function initDatabase() {
         escalated_by_tag TEXT
       );
 
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS guild_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ticket_number TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS opener_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS opener_tag TEXT NOT NULL DEFAULT '';
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS type_config JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS answers JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open';
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_by_id TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_by_tag TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS close_reason TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS claimed_by_id TEXT;
+      ALTER TABLE tickets ADD COLUMN IF NOT EXISTS claimed_by_tag TEXT;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_to_owner BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_at TIMESTAMPTZ;
       ALTER TABLE tickets ADD COLUMN IF NOT EXISTS escalated_by_id TEXT;
