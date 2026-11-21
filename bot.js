@@ -269,7 +269,7 @@ async function initDatabase() {
     console.log('PostgreSQL schema ready.');
   } catch (err) {
     await clientDb.query('ROLLBACK').catch(() => {});
-    throw err;
+    console.error('initDatabase warning/error:', err.message);
   } finally {
     clientDb.release();
   }
@@ -333,9 +333,11 @@ async function syncGuildMeta(guild) {
 function buildPanelPayload(config) {
   const embed = new EmbedBuilder()
     .setColor(0xc9a65c)
-    .setTitle(config.panelTitle || 'إنشاء تذكرة');
+    .setTitle(String(config.panelTitle || 'إنشاء تذكرة').slice(0, 256));
 
-  if (config.panelDescription) embed.setDescription(config.panelDescription);
+  if (config.panelDescription) {
+    embed.setDescription(String(config.panelDescription).slice(0, 4096));
+  }
 
   if (config.panelImageUrl && /^https?:\/\//i.test(config.panelImageUrl.trim())) {
     embed.setImage(config.panelImageUrl.trim());
@@ -348,22 +350,22 @@ function buildPanelPayload(config) {
     });
   }
 
-  const types = Array.isArray(config.ticketTypes) ? config.ticketTypes : [];
+  const types = Array.isArray(config.ticketTypes) ? config.ticketTypes.slice(0, 25) : [];
   const rows = [];
   let currentRow = new ActionRowBuilder();
 
   for (let i = 0; i < types.length; i++) {
-    const type = types[i];
+    const type = normalizeTicketType(types[i]);
 
     embed.addFields({
-      name: type.sectionTitle || `نوع #${i + 1}`,
-      value: type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.',
+      name: String(type.sectionTitle || `نوع #${i + 1}`).slice(0, 256),
+      value: String(type.sectionDescription || 'اضغط الزر أدناه لفتح الشكوى.').slice(0, 1024),
       inline: false
     });
 
     const button = new ButtonBuilder()
       .setCustomId(`open_ticket_type:${type.id}`)
-      .setLabel((type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80))
+      .setLabel(String(type.buttonLabel || type.sectionTitle || 'فتح شكوى').slice(0, 80))
       .setStyle(mapButtonStyle(type.buttonStyle));
 
     if (currentRow.components.length >= 5) {
@@ -382,27 +384,38 @@ function buildPanelPayload(config) {
 }
 
 async function ensurePanelChannel(config, forceNew = false) {
-  if (!config?.panelChannelId) return null;
+  const normCfg = normalizeConfig(config || {});
+  if (!normCfg.panelChannelId) {
+    console.warn('Panel skipped: panelChannelId is empty in config.');
+    return { ok: false, reason: 'لم يتم تحديد روم اللوحة في الإعدادات وحفظه.' };
+  }
 
-  const guild = await client.guilds.fetch(GUILD_ID);
-  const channel = await guild.channels.fetch(config.panelChannelId).catch(() => null);
+  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+  if (!guild) {
+    console.warn('Panel skipped: GUILD_ID not reachable.');
+    return { ok: false, reason: 'تعذر الوصول إلى السيرفر.' };
+  }
 
-  if (!channel || channel.type !== ChannelType.GuildText) return null;
+  const channel = await guild.channels.fetch(normCfg.panelChannelId).catch(() => null);
+  if (!channel || channel.type !== ChannelType.GuildText) {
+    console.warn(`Panel skipped: channel ${normCfg.panelChannelId} not found or not text channel.`);
+    return { ok: false, reason: 'روم اللوحة غير موجود أو ليس روماً نصياً.' };
+  }
 
   const signature = JSON.stringify({
-    ch: config.panelChannelId,
-    img: config.panelImageUrl,
-    title: config.panelTitle,
-    desc: config.panelDescription,
-    notes: config.panelNotes,
-    types: config.ticketTypes
+    ch: normCfg.panelChannelId,
+    img: normCfg.panelImageUrl,
+    title: normCfg.panelTitle,
+    desc: normCfg.panelDescription,
+    notes: normCfg.panelNotes,
+    types: normCfg.ticketTypes
   });
 
   if (!forceNew && signature === lastPanelSignature && lastPanelMessageId) {
-    return channel;
+    return { ok: true, channel };
   }
 
-  const payload = buildPanelPayload(config);
+  const payload = buildPanelPayload(normCfg);
 
   if (!forceNew && lastPanelMessageId) {
     const oldMessage = await channel.messages.fetch(lastPanelMessageId).catch(() => null);
@@ -410,15 +423,17 @@ async function ensurePanelChannel(config, forceNew = false) {
     if (oldMessage) {
       await oldMessage.edit(payload);
       lastPanelSignature = signature;
-      return channel;
+      console.log(`Panel updated in #${channel.name} (${channel.id})`);
+      return { ok: true, channel };
     }
   }
 
   const sent = await channel.send(payload);
   lastPanelMessageId = sent.id;
   lastPanelSignature = signature;
+  console.log(`Panel sent in #${channel.name} (${channel.id}), msg=${sent.id}, types=${normCfg.ticketTypes.length}`);
 
-  return channel;
+  return { ok: true, channel };
 }
 
 async function registerCommands() {
@@ -1080,10 +1095,16 @@ client.on('interactionCreate', async interaction => {
         });
       }
 
-      await ensurePanelChannel(cfg, true);
+      const panelRes = await ensurePanelChannel(cfg, true);
+      if (!panelRes?.ok) {
+        return interaction.reply({
+          content: `تعذر إرسال اللوحة: ${panelRes?.reason || 'تحقق من إعدادات روم اللوحة وحفظها من لوحة التحكم.'}`,
+          ephemeral: true
+        });
+      }
 
       return interaction.reply({
-        content: 'تم إرسال لوحة الشكاوى بنجاح.',
+        content: `تم إرسال لوحة الشكاوى بنجاح في ${panelRes.channel}.`,
         ephemeral: true
       });
     }
